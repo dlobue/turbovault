@@ -15,6 +15,11 @@ pub enum Outcome {
     ConcurrencyError,
     /// In-place op on an absent path: `FileNotFound`, nothing created.
     NoFile,
+    /// An op-specific refusal that is neither a concurrency conflict nor a
+    /// missing file, with **no disk change** — e.g. `edit_note`'s SEARCH text
+    /// matching nothing. Surfaced by `edit_note`'s one-off; kept general so
+    /// other ops can reuse it.
+    OpError,
 }
 
 /// How an operation failed, classified across layers.
@@ -59,49 +64,77 @@ impl Observed {
 }
 
 impl Outcome {
-    /// Assert `observed` matches this expected outcome. `before` is the target's
-    /// content immediately before the op — a refusal must leave it byte-for-byte
-    /// intact (the no-clobber invariant these tests exist to protect).
+    /// Check `observed` against this expected outcome, returning `Err(reason)` on
+    /// mismatch so the runner can collect every cell's result (rather than
+    /// panicking on the first). `before` is the target's content immediately
+    /// before the op — a refusal must leave it byte-for-byte intact (the
+    /// no-clobber invariant these tests exist to protect).
     ///
     /// The specific *effect* of an `Ok` (what bytes/deletion resulted) is the
-    /// adapter's assertion; here `Ok` checks only that the op succeeded, so this
+    /// adapter's concern; here `Ok` checks only that the op succeeded, so this
     /// stays operation-agnostic.
-    pub fn assert(self, observed: &Observed, before: Option<&str>) {
+    pub fn check(self, observed: &Observed, before: Option<&str>) -> Result<(), String> {
         match self {
-            Outcome::Ok => assert!(
-                observed.succeeded,
-                "expected OK, got failure {:?}",
-                observed.error
-            ),
+            Outcome::Ok => {
+                if !observed.succeeded {
+                    return Err(format!("expected OK, got failure {:?}", observed.error));
+                }
+            }
             Outcome::ConcurrencyError => {
-                assert!(
-                    !observed.succeeded,
-                    "expected ConcurrencyError, but the op SUCCEEDED (a clobber/defect)"
-                );
-                assert_eq!(
-                    observed.error,
-                    Some(ObservedError::Concurrency),
-                    "expected a concurrency refusal"
-                );
-                assert_eq!(
-                    observed.after_content.as_deref(),
-                    before,
-                    "ConcurrencyError must leave the working tree unchanged (no clobber)"
-                );
+                if observed.succeeded {
+                    return Err(
+                        "expected ConcurrencyError, but the op SUCCEEDED (a clobber/defect)".into(),
+                    );
+                }
+                if observed.error != Some(ObservedError::Concurrency) {
+                    return Err(format!(
+                        "expected a concurrency refusal, got {:?}",
+                        observed.error
+                    ));
+                }
+                if observed.after_content.as_deref() != before {
+                    return Err(
+                        "ConcurrencyError must leave the working tree unchanged (no clobber)"
+                            .into(),
+                    );
+                }
             }
             Outcome::NoFile => {
-                assert!(!observed.succeeded, "expected NoFile, but the op SUCCEEDED");
-                assert_eq!(
-                    observed.error,
-                    Some(ObservedError::NotFound),
-                    "expected a not-found refusal"
-                );
-                assert_eq!(
-                    observed.after_content.as_deref(),
-                    before,
-                    "NoFile must not create the target"
-                );
+                if observed.succeeded {
+                    return Err("expected NoFile, but the op SUCCEEDED".into());
+                }
+                if observed.error != Some(ObservedError::NotFound) {
+                    return Err(format!(
+                        "expected a not-found refusal, got {:?}",
+                        observed.error
+                    ));
+                }
+                if observed.after_content.as_deref() != before {
+                    return Err("NoFile must not create the target".into());
+                }
             }
+            Outcome::OpError => {
+                if observed.succeeded {
+                    return Err("expected OpError, but the op SUCCEEDED".into());
+                }
+                if observed.error != Some(ObservedError::Other) {
+                    return Err(format!(
+                        "expected an op-specific error, got {:?}",
+                        observed.error
+                    ));
+                }
+                if observed.after_content.as_deref() != before {
+                    return Err("OpError must leave the working tree unchanged".into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Panicking form of [`Self::check`] for direct unit assertions.
+    pub fn assert(self, observed: &Observed, before: Option<&str>) {
+        if let Err(msg) = self.check(observed, before) {
+            panic!("{msg}");
         }
     }
 }

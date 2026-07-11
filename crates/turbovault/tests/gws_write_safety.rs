@@ -16,3 +16,6 @@
 // harness.rs then resolve relative to `gws_write_safety/harness/`.
 #[path = "gws_write_safety/harness/mod.rs"]
 mod harness;
+
+#[path = "gws_write_safety/adapters/mod.rs"]
+mod adapters;

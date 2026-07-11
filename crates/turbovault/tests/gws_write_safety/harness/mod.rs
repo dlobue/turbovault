@@ -4,7 +4,9 @@
 //! under test. Each mutating op is a thin adapter (later phases) that composes
 //! these. See the design doc §7.
 
+pub mod adapter;
 pub mod backend;
 pub mod outcome;
 pub mod precondition;
+pub mod runner;
 pub mod state;
