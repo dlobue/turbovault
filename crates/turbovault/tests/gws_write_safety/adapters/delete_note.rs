@@ -6,13 +6,13 @@
 //! tool-layer behavior today, not substrate-layer, so at this layer it's a
 //! deferred one-off (noted below), tracked with the substrate move of oz6.
 
-use crate::harness::adapter::{Case, SinglePathOp, run_single_path};
+use super::{Case, SinglePathOp};
 use crate::harness::backend::{World, observe};
 use crate::harness::outcome::{Observed, Outcome as O};
 use crate::harness::precondition::{Precondition, PreconditionKind as P};
-use crate::harness::runner::report;
 use crate::harness::state::GitState as S;
 
+#[derive(Clone, Copy)]
 pub struct DeleteNote;
 
 impl SinglePathOp for DeleteNote {
@@ -71,8 +71,3 @@ const CASES: &[Case] = &[
         "GWS: no dirty gate for delete",
     ),
 ];
-
-#[tokio::test]
-async fn delete_note_matrix() {
-    report("delete_note", run_single_path(&DeleteNote).await);
-}

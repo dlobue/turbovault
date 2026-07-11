@@ -14,8 +14,8 @@
 // for a sibling `tests/harness.rs` (which cargo would compile as a stray test
 // binary). `#[path]` keeps the harness in its own subtree; nested `mod`s inside
 // harness.rs then resolve relative to `gws_write_safety/harness/`.
+// This target (default harness) runs the harness's OWN unit tests — the meta
+// tests that keep the primitives honest. The matrix cells run in the sibling
+// `gws_matrix` target (harness=false), one named trial per cell.
 #[path = "gws_write_safety/harness/mod.rs"]
 mod harness;
-
-#[path = "gws_write_safety/adapters/mod.rs"]
-mod adapters;

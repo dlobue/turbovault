@@ -95,9 +95,20 @@ serial_test = "3"
 turbomcp-client = "3.1.5"
 turbomcp-transport = "3.1.5"
 turbomcp-protocol = "3.1.5"
+# turbovault-nbl.2: per-cell named tests for the GWS write-safety matrix. A
+# custom (harness=false) test binary collects one runtime trial per matrix
+# cell, so each cell is its own `cargo test` entry — filterable, individually
+# runnable, and pending cells show as `ignored` (the burndown).
+libtest-mimic = "0.8"
 
 [[bench]]
 name = "tool_benchmarks"
+harness = false
+
+# The write-safety matrix runs one named trial per cell (turbovault-nbl.2); the
+# harness self-tests stay in the default-harness `gws_write_safety` target.
+[[test]]
+name = "gws_matrix"
 harness = false
 
 [package.metadata.docs.rs]

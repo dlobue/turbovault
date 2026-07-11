@@ -4,18 +4,21 @@
 //! It surfaces one new primitive need: the SEARCH-not-found case is an
 //! [`Outcome::OpError`] — a refusal that is neither a concurrency conflict nor a
 //! missing file. That's an op-specific one-off (it varies the SEARCH text, not
-//! the precondition/state), so it lives in its own test outside the grid.
+//! the precondition/state), so it's a bespoke trial ([`extra_trials`]) rather
+//! than a grid cell.
 
-use crate::harness::adapter::{Case, REL, SinglePathOp, run_single_path};
+use libtest_mimic::Trial;
+
+use super::{Case, REL, SinglePathOp, cell_trial};
 use crate::harness::backend::{World, observe};
 use crate::harness::outcome::{Observed, Outcome as O};
 use crate::harness::precondition::{Precondition, PreconditionKind as P};
-use crate::harness::runner::report;
 use crate::harness::state::{GitState as S, build_state};
 
 /// The replacement text — `ok_effect` checks the edited file contains it.
 const NEW: &str = "gws-edited";
 
+#[derive(Clone, Copy)]
 pub struct EditNote;
 
 /// A whole-content SEARCH/REPLACE block: SEARCH the file's current bytes,
@@ -88,29 +91,26 @@ const CASES: &[Case] = &[
     ),
 ];
 
-#[tokio::test]
-async fn edit_note_matrix() {
-    report("edit_note", run_single_path(&EditNote).await);
-}
+/// Op-specific one-offs (outside the precondition × state grid): a SEARCH that
+/// matches nothing is an `OpError` — the op refuses, the working tree untouched.
+pub fn extra_trials() -> Vec<Trial> {
+    vec![cell_trial(
+        "edit_note::one-off::search-not-found::OpError".to_string(),
+        None,
+        || async {
+            let world = World::git();
+            build_state(world.dir.path(), REL, S::CleanCommitted);
+            let before = world.read(REL);
 
-/// One-off (outside the grid): a SEARCH that matches nothing is an `OpError` —
-/// the op refuses, the working tree is untouched.
-#[tokio::test]
-async fn edit_note_search_not_found_is_op_error() {
-    let world = World::git();
-    build_state(world.dir.path(), REL, S::CleanCommitted);
-    let before = world.read(REL);
+            let edits = "<<<<<<< SEARCH\nNONEXISTENT-TEXT\n=======\nx\n>>>>>>> REPLACE\n";
+            let res = world
+                .tools
+                .edit_file(REL, edits, None, false)
+                .await
+                .map(|_| ());
+            let after = world.read(REL);
 
-    let edits = "<<<<<<< SEARCH\nNONEXISTENT-TEXT\n=======\nx\n>>>>>>> REPLACE\n";
-    let res = world
-        .tools
-        .edit_file(REL, edits, None, false)
-        .await
-        .map(|_| ());
-    let after = world.read(REL);
-
-    let observed = observe(res, after);
-    if let Err(e) = O::OpError.check(&observed, before.as_deref()) {
-        panic!("edit_note SEARCH-not-found: {e}");
-    }
+            O::OpError.check(&observe(res, after), before.as_deref())
+        },
+    )]
 }

@@ -6,11 +6,10 @@
 //! the precondition to the real op directly; nothing else changes. Running it
 //! against the current API now is what surfaces the defects as failing cells.
 
-use crate::harness::adapter::{Case, SinglePathOp, run_single_path};
+use super::{Case, SinglePathOp};
 use crate::harness::backend::{World, observe};
 use crate::harness::outcome::{Observed, Outcome as O};
 use crate::harness::precondition::{Precondition, PreconditionKind as P};
-use crate::harness::runner::report;
 use crate::harness::state::GitState as S;
 use turbovault_tools::WriteMode;
 
@@ -18,6 +17,7 @@ use turbovault_tools::WriteMode;
 /// generations so an `Ok` is observable as a real change.
 const CONTENT: &str = "gws-written\n";
 
+#[derive(Clone, Copy)]
 pub struct WriteNote;
 
 impl SinglePathOp for WriteNote {
@@ -164,8 +164,3 @@ const CASES: &[Case] = &[
     Case::new(P::Wrong, S::NewStagedUnstaged, O::ConcurrencyError),
     Case::new(P::Wrong, S::Untracked, O::ConcurrencyError),
 ];
-
-#[tokio::test]
-async fn write_note_matrix() {
-    report("write_note", run_single_path(&WriteNote).await);
-}

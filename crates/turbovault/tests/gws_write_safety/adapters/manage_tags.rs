@@ -3,16 +3,16 @@
 //! of `edit_note` / `update_frontmatter` (current-API path: single-op
 //! `batch_execute` of a `ManageTags` add).
 
-use crate::harness::adapter::{Case, SinglePathOp, run_single_path};
+use super::{Case, SinglePathOp};
 use crate::harness::backend::{World, observe};
 use crate::harness::outcome::{Observed, Outcome as O};
 use crate::harness::precondition::{Precondition, PreconditionKind as P};
-use crate::harness::runner::report;
 use crate::harness::state::GitState as S;
 use turbovault_tools::BatchOperation;
 
 const TAG: &str = "gws-tag";
 
+#[derive(Clone, Copy)]
 pub struct ManageTags;
 
 impl SinglePathOp for ManageTags {
@@ -84,8 +84,3 @@ const CASES: &[Case] = &[
         "GWS: no dirty gate for in-place tag update",
     ),
 ];
-
-#[tokio::test]
-async fn manage_tags_matrix() {
-    report("manage_tags", run_single_path(&ManageTags).await);
-}

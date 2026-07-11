@@ -5,17 +5,17 @@
 //! single-op `batch_execute`. Structurally identical to `edit_note`, so it
 //! surfaces no new primitive requirement — a mold-confirming sibling.
 
-use crate::harness::adapter::{Case, SinglePathOp, run_single_path};
+use super::{Case, SinglePathOp};
 use crate::harness::backend::{World, observe};
 use crate::harness::outcome::{Observed, Outcome as O};
 use crate::harness::precondition::{Precondition, PreconditionKind as P};
-use crate::harness::runner::report;
 use crate::harness::state::GitState as S;
 use std::collections::HashMap;
 use turbovault_tools::BatchOperation;
 
 const KEY: &str = "gws_touched";
 
+#[derive(Clone, Copy)]
 pub struct UpdateFrontmatter;
 
 impl SinglePathOp for UpdateFrontmatter {
@@ -89,11 +89,3 @@ const CASES: &[Case] = &[
         "GWS: no dirty gate for in-place frontmatter update",
     ),
 ];
-
-#[tokio::test]
-async fn update_frontmatter_matrix() {
-    report(
-        "update_frontmatter",
-        run_single_path(&UpdateFrontmatter).await,
-    );
-}
