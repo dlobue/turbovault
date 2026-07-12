@@ -52,22 +52,97 @@ impl SinglePathOp for DeleteNote {
     }
 }
 
-/// Representative slice. delete's precondition axis is {Exists, Head, Index,
-/// Workdir, Wrong} — no Blind/Absent (delete needs an existing target).
+/// The **full** delete_note matrix. In-place op → precondition axis
+/// {Exists, Head, Index, Workdir, Wrong}. Two cells diverge from the other
+/// in-place ops (edit/frontmatter/tags): `Exists`+absent is an **idempotent OK**
+/// (the goal, absence, already holds — ratified) and `Wrong`+absent is a
+/// `ConcurrencyError` (the caller asserted a blob that isn't there), *not*
+/// `NoFile`. Head/Index/Workdir rows are identical to the other in-place ops.
+/// `pending` set determined by running (design doc §6).
 const CASES: &[Case] = &[
-    // In-place default on a clean file deletes it.
-    Case::new(P::Exists, S::CleanCommitted, O::Ok),
-    // Deleting an absent target is an idempotent no-op success (the goal —
-    // absence — already holds). Distinct from edit, which needs content.
+    // ── ExpectExists (in-place default, dirty-gated) ─────────────────────────
+    // Deleting an absent target is an idempotent no-op success; clean deletes.
     Case::new(P::Exists, S::Absent, O::Ok),
-    // A wrong token refuses.
-    Case::new(P::Wrong, S::CleanCommitted, O::ConcurrencyError),
-    // DEFECT: deleting with no content proof on a dirty tree should refuse —
-    // today it deletes, discarding the uncommitted content.
+    Case::new(P::Exists, S::CleanCommitted, O::Ok),
+    // No content proof on a dirty tree must refuse — today no dirty gate, so it
+    // deletes and discards the uncommitted content.
+    Case::pending(
+        P::Exists,
+        S::CommittedStaged,
+        O::ConcurrencyError,
+        DIRTY_GATE,
+    ),
     Case::pending(
         P::Exists,
         S::CommittedUnstaged,
         O::ConcurrencyError,
-        "GWS: no dirty gate for delete",
+        DIRTY_GATE,
     ),
+    Case::pending(
+        P::Exists,
+        S::CommittedStagedUnstaged,
+        O::ConcurrencyError,
+        DIRTY_GATE,
+    ),
+    Case::pending(P::Exists, S::NewStaged, O::ConcurrencyError, DIRTY_GATE),
+    Case::pending(P::Exists, S::IntentToAdd, O::ConcurrencyError, DIRTY_GATE),
+    Case::pending(
+        P::Exists,
+        S::NewStagedUnstaged,
+        O::ConcurrencyError,
+        DIRTY_GATE,
+    ),
+    Case::pending(P::Exists, S::Untracked, O::ConcurrencyError, DIRTY_GATE),
+    // ── ExpectBlob(HEAD) — defined iff committed ─────────────────────────────
+    Case::new(P::Head, S::CleanCommitted, O::Ok),
+    Case::pending(
+        P::Head,
+        S::CommittedStaged,
+        O::ConcurrencyError,
+        HEAD_CLOBBER,
+    ),
+    Case::pending(
+        P::Head,
+        S::CommittedUnstaged,
+        O::ConcurrencyError,
+        HEAD_CLOBBER,
+    ),
+    Case::pending(
+        P::Head,
+        S::CommittedStagedUnstaged,
+        O::ConcurrencyError,
+        HEAD_CLOBBER,
+    ),
+    // ── ExpectBlob(INDEX) — defined iff staged ───────────────────────────────
+    Case::pending(P::Index, S::CommittedStaged, O::Ok, PRECOND_VS_HEAD),
+    Case::pending(P::Index, S::NewStaged, O::Ok, PRECOND_VS_HEAD),
+    Case::new(P::Index, S::CommittedStagedUnstaged, O::ConcurrencyError),
+    Case::new(P::Index, S::NewStagedUnstaged, O::ConcurrencyError),
+    // ── ExpectBlob(WORKDIR) — proving on-disk bytes; SKIP where == HEAD/INDEX ─
+    Case::pending(P::Workdir, S::CommittedUnstaged, O::Ok, PRECOND_VS_HEAD),
+    Case::pending(
+        P::Workdir,
+        S::CommittedStagedUnstaged,
+        O::Ok,
+        PRECOND_VS_HEAD,
+    ),
+    Case::pending(P::Workdir, S::IntentToAdd, O::Ok, PRECOND_VS_HEAD),
+    Case::pending(P::Workdir, S::NewStagedUnstaged, O::Ok, PRECOND_VS_HEAD),
+    Case::pending(P::Workdir, S::Untracked, O::Ok, PRECOND_VS_HEAD),
+    // ── ExpectBlob(WRONG) → refuse everywhere, incl. absent ──────────────────
+    Case::new(P::Wrong, S::Absent, O::ConcurrencyError),
+    Case::new(P::Wrong, S::CleanCommitted, O::ConcurrencyError),
+    Case::new(P::Wrong, S::CommittedStaged, O::ConcurrencyError),
+    Case::new(P::Wrong, S::CommittedUnstaged, O::ConcurrencyError),
+    Case::new(P::Wrong, S::CommittedStagedUnstaged, O::ConcurrencyError),
+    Case::new(P::Wrong, S::NewStaged, O::ConcurrencyError),
+    Case::new(P::Wrong, S::IntentToAdd, O::ConcurrencyError),
+    Case::new(P::Wrong, S::NewStagedUnstaged, O::ConcurrencyError),
+    Case::new(P::Wrong, S::Untracked, O::ConcurrencyError),
 ];
+
+// Burndown reasons.
+const DIRTY_GATE: &str = "GWS: no dirty gate for delete (discards uncommitted content)";
+const HEAD_CLOBBER: &str =
+    "GWS: dirty-tree clobber — HEAD token passes vs HEAD, delete discards dirty content";
+const PRECOND_VS_HEAD: &str = "GWS: precondition checked vs HEAD, not the working tree";

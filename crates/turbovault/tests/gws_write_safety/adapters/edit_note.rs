@@ -72,24 +72,103 @@ impl SinglePathOp for EditNote {
     }
 }
 
-/// Representative slice of the edit_note matrix (full grid follows). edit's
-/// precondition axis is {Exists, Head, Index, Workdir, Wrong} — no Blind/Absent.
+/// The **full** edit_note matrix, transcribed from the corrected CSV (edit_note
+/// is the 2nd operation there). In-place op → precondition axis
+/// {Exists, Head, Index, Workdir, Wrong} (no Blind/Absent). N/A cells (token
+/// undefined for the state) and SKIP duplicates (WORKDIR == HEAD/INDEX) are
+/// omitted. `pending` = a cell current code gets wrong (the burndown), set by
+/// running the grid (design doc §6 empirical method).
 const CASES: &[Case] = &[
-    // In-place default on a clean file edits it.
-    Case::new(P::Exists, S::CleanCommitted, O::Ok),
-    // Edit requires an existing file.
+    // ── ExpectExists (in-place default, dirty-gated) ─────────────────────────
+    // Edit needs an existing file; clean file edits.
     Case::new(P::Exists, S::Absent, O::NoFile),
-    // A wrong token refuses.
-    Case::new(P::Wrong, S::CleanCommitted, O::ConcurrencyError),
-    // DEFECT: an in-place edit with no content proof on a dirty tree should
-    // refuse — today it edits the dirty bytes and commits (no dirty gate).
+    Case::new(P::Exists, S::CleanCommitted, O::Ok),
+    // No content proof on a dirty/uncommitted tree must refuse — today no dirty
+    // gate, so the op edits the dirty bytes and commits.
+    Case::pending(
+        P::Exists,
+        S::CommittedStaged,
+        O::ConcurrencyError,
+        DIRTY_GATE,
+    ),
     Case::pending(
         P::Exists,
         S::CommittedUnstaged,
         O::ConcurrencyError,
-        "GWS: no dirty gate for in-place edits",
+        DIRTY_GATE,
     ),
+    Case::pending(
+        P::Exists,
+        S::CommittedStagedUnstaged,
+        O::ConcurrencyError,
+        DIRTY_GATE,
+    ),
+    Case::pending(P::Exists, S::NewStaged, O::ConcurrencyError, DIRTY_GATE),
+    Case::pending(P::Exists, S::IntentToAdd, O::ConcurrencyError, DIRTY_GATE),
+    Case::pending(
+        P::Exists,
+        S::NewStagedUnstaged,
+        O::ConcurrencyError,
+        DIRTY_GATE,
+    ),
+    Case::pending(P::Exists, S::Untracked, O::ConcurrencyError, DIRTY_GATE),
+    // ── ExpectBlob(HEAD) — defined iff committed ─────────────────────────────
+    Case::new(P::Head, S::CleanCommitted, O::Ok),
+    // HEAD token matches HEAD-tree, so it passes vs HEAD and edits dirty bytes.
+    Case::pending(
+        P::Head,
+        S::CommittedStaged,
+        O::ConcurrencyError,
+        HEAD_CLOBBER,
+    ),
+    Case::pending(
+        P::Head,
+        S::CommittedUnstaged,
+        O::ConcurrencyError,
+        HEAD_CLOBBER,
+    ),
+    Case::pending(
+        P::Head,
+        S::CommittedStagedUnstaged,
+        O::ConcurrencyError,
+        HEAD_CLOBBER,
+    ),
+    // ── ExpectBlob(INDEX) — defined iff staged ───────────────────────────────
+    // INDEX == workdir (no unstaged) → proving current bytes; today vs HEAD → refuse.
+    Case::pending(P::Index, S::CommittedStaged, O::Ok, PRECOND_VS_HEAD),
+    Case::pending(P::Index, S::NewStaged, O::Ok, PRECOND_VS_HEAD),
+    // INDEX != workdir (unstaged on top) → correctly refuses today.
+    Case::new(P::Index, S::CommittedStagedUnstaged, O::ConcurrencyError),
+    Case::new(P::Index, S::NewStagedUnstaged, O::ConcurrencyError),
+    // ── ExpectBlob(WORKDIR) — proving on-disk bytes; SKIP where == HEAD/INDEX ─
+    // All should be OK (you proved current bytes); today checked vs HEAD.
+    Case::pending(P::Workdir, S::CommittedUnstaged, O::Ok, PRECOND_VS_HEAD),
+    Case::pending(
+        P::Workdir,
+        S::CommittedStagedUnstaged,
+        O::Ok,
+        PRECOND_VS_HEAD,
+    ),
+    Case::pending(P::Workdir, S::IntentToAdd, O::Ok, PRECOND_VS_HEAD),
+    Case::pending(P::Workdir, S::NewStagedUnstaged, O::Ok, PRECOND_VS_HEAD),
+    Case::pending(P::Workdir, S::Untracked, O::Ok, PRECOND_VS_HEAD),
+    // ── ExpectBlob(WRONG) → refuse everywhere; NoFile on absent (in-place) ────
+    Case::new(P::Wrong, S::Absent, O::NoFile),
+    Case::new(P::Wrong, S::CleanCommitted, O::ConcurrencyError),
+    Case::new(P::Wrong, S::CommittedStaged, O::ConcurrencyError),
+    Case::new(P::Wrong, S::CommittedUnstaged, O::ConcurrencyError),
+    Case::new(P::Wrong, S::CommittedStagedUnstaged, O::ConcurrencyError),
+    Case::new(P::Wrong, S::NewStaged, O::ConcurrencyError),
+    Case::new(P::Wrong, S::IntentToAdd, O::ConcurrencyError),
+    Case::new(P::Wrong, S::NewStagedUnstaged, O::ConcurrencyError),
+    Case::new(P::Wrong, S::Untracked, O::ConcurrencyError),
 ];
+
+// Burndown reasons (shared by the cells that pin each defect).
+const DIRTY_GATE: &str = "GWS: no dirty gate for in-place edit (edits uncommitted bytes)";
+const HEAD_CLOBBER: &str =
+    "GWS: dirty-tree clobber — HEAD token passes vs HEAD, edit applies to dirty bytes";
+const PRECOND_VS_HEAD: &str = "GWS: precondition checked vs HEAD, not the working tree";
 
 /// Op-specific one-offs (outside the precondition × state grid): a SEARCH that
 /// matches nothing is an `OpError` — the op refuses, the working tree untouched.
