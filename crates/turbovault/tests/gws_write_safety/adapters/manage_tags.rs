@@ -59,28 +59,98 @@ impl SinglePathOp for ManageTags {
     }
 }
 
+/// The **full** manage_tags matrix — same in-place shape and desired outcomes as
+/// `edit_note` / `update_frontmatter`. Same vehicle as update_frontmatter (MCP
+/// tool blind-overwrites; this adapter drives the batch fold), so the same
+/// pending split: only the two clean cells pass. Split set by running (§6).
 const CASES: &[Case] = &[
+    // ── ExpectExists (in-place default, dirty-gated) ─────────────────────────
+    Case::pending(P::Exists, S::Absent, O::NoFile, CREATE_ON_ABSENT),
     Case::new(P::Exists, S::CleanCommitted, O::Ok),
-    // FINDING: adding a tag to an absent file currently CREATES it; an in-place
-    // op should NoFile instead.
     Case::pending(
         P::Exists,
-        S::Absent,
-        O::NoFile,
-        "GWS: in-place tag update on an absent target creates it; should NoFile",
-    ),
-    // FINDING: a wrong expected_hash is not enforced for the batch ManageTags
-    // fold — it should refuse (silent-overwrite CAS gap).
-    Case::pending(
-        P::Wrong,
-        S::CleanCommitted,
+        S::CommittedStaged,
         O::ConcurrencyError,
-        "GWS/verify: batch ManageTags does not enforce expected_hash",
+        DIRTY_GATE,
     ),
     Case::pending(
         P::Exists,
         S::CommittedUnstaged,
         O::ConcurrencyError,
-        "GWS: no dirty gate for in-place tag update",
+        DIRTY_GATE,
     ),
+    Case::pending(
+        P::Exists,
+        S::CommittedStagedUnstaged,
+        O::ConcurrencyError,
+        DIRTY_GATE,
+    ),
+    Case::pending(P::Exists, S::NewStaged, O::ConcurrencyError, DIRTY_GATE),
+    Case::pending(P::Exists, S::IntentToAdd, O::ConcurrencyError, DIRTY_GATE),
+    Case::pending(
+        P::Exists,
+        S::NewStagedUnstaged,
+        O::ConcurrencyError,
+        DIRTY_GATE,
+    ),
+    Case::pending(P::Exists, S::Untracked, O::ConcurrencyError, DIRTY_GATE),
+    // ── ExpectBlob(HEAD) — defined iff committed ─────────────────────────────
+    Case::new(P::Head, S::CleanCommitted, O::Ok),
+    Case::pending(
+        P::Head,
+        S::CommittedStaged,
+        O::ConcurrencyError,
+        HEAD_CLOBBER,
+    ),
+    Case::pending(
+        P::Head,
+        S::CommittedUnstaged,
+        O::ConcurrencyError,
+        HEAD_CLOBBER,
+    ),
+    Case::pending(
+        P::Head,
+        S::CommittedStagedUnstaged,
+        O::ConcurrencyError,
+        HEAD_CLOBBER,
+    ),
+    // ── ExpectBlob(INDEX) — defined iff staged ───────────────────────────────
+    Case::pending(P::Index, S::CommittedStaged, O::Ok, VS_HEAD),
+    Case::pending(P::Index, S::NewStaged, O::Ok, VS_HEAD),
+    Case::pending(
+        P::Index,
+        S::CommittedStagedUnstaged,
+        O::ConcurrencyError,
+        VS_HEAD,
+    ),
+    Case::pending(P::Index, S::NewStagedUnstaged, O::ConcurrencyError, VS_HEAD),
+    // ── ExpectBlob(WORKDIR) — proving on-disk bytes; SKIP where == HEAD/INDEX ─
+    Case::pending(P::Workdir, S::CommittedUnstaged, O::Ok, VS_HEAD),
+    Case::pending(P::Workdir, S::CommittedStagedUnstaged, O::Ok, VS_HEAD),
+    Case::pending(P::Workdir, S::IntentToAdd, O::Ok, VS_HEAD),
+    Case::pending(P::Workdir, S::NewStagedUnstaged, O::Ok, VS_HEAD),
+    Case::pending(P::Workdir, S::Untracked, O::Ok, VS_HEAD),
+    // ── ExpectBlob(WRONG) → refuse everywhere; NoFile on absent ──────────────
+    Case::pending(P::Wrong, S::Absent, O::NoFile, CREATE_ON_ABSENT),
+    Case::pending(P::Wrong, S::CleanCommitted, O::ConcurrencyError, VS_HEAD),
+    Case::pending(P::Wrong, S::CommittedStaged, O::ConcurrencyError, VS_HEAD),
+    Case::pending(P::Wrong, S::CommittedUnstaged, O::ConcurrencyError, VS_HEAD),
+    Case::pending(
+        P::Wrong,
+        S::CommittedStagedUnstaged,
+        O::ConcurrencyError,
+        VS_HEAD,
+    ),
+    Case::pending(P::Wrong, S::NewStaged, O::ConcurrencyError, VS_HEAD),
+    Case::pending(P::Wrong, S::IntentToAdd, O::ConcurrencyError, VS_HEAD),
+    Case::pending(P::Wrong, S::NewStagedUnstaged, O::ConcurrencyError, VS_HEAD),
+    Case::pending(P::Wrong, S::Untracked, O::ConcurrencyError, VS_HEAD),
 ];
+
+// Burndown reasons (same defects as update_frontmatter — no precondition-honoring
+// write path today).
+const CREATE_ON_ABSENT: &str =
+    "GWS: in-place tag update on an absent target creates it; should NoFile";
+const DIRTY_GATE: &str = "GWS: no dirty gate — commits uncommitted content on a dirty tree";
+const HEAD_CLOBBER: &str = "GWS: HEAD token passes vs HEAD, clobbers the dirty tree";
+const VS_HEAD: &str = "GWS: precondition checked vs HEAD, not the working tree (batch masks the refusal as a no-op Ok)";
