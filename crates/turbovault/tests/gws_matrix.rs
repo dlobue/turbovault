@@ -31,11 +31,13 @@ fn main() {
         adapters::update_frontmatter::UpdateFrontmatter,
     ));
     tests.extend(single_path_trials(adapters::manage_tags::ManageTags));
+    tests.extend(single_path_trials(
+        adapters::create_from_template::CreateFromTemplate,
+    ));
     // Op-specific one-offs + the odd shapes (dual-path, multi-op).
     tests.extend(adapters::edit_note::extra_trials());
     tests.extend(adapters::move_note::trials());
     tests.extend(adapters::batch_execute::trials());
-    tests.extend(adapters::create_from_template::trials());
 
     libtest_mimic::run(&args, tests).exit();
 }
