@@ -24,7 +24,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 use turbovault::ObsidianMcpServer;
 use turbovault_core::config::{VaultConfig, VaultGitConfig, WriteBackend};
-use turbovault_tools::{BatchOperation, VaultRepo};
+use turbovault_tools::{BatchOperation, VaultRepo, WriteMode};
 
 /// Set up a real git repo with an initial commit + a server with the
 /// vault registered as `write_backend: Git`. Returns the temp dir
@@ -82,12 +82,12 @@ async fn e2e_write_note_commits_to_git_with_tool_name_verb() {
 
     let head_before = head_oid(tmp.path()).unwrap();
     tools
-        .write_file_with_mode_and_message(
+        .write_file(
             "concepts/foo.md",
             "# Foo\n\nplaceholder\n",
-            turbovault_tools::WriteMode::Overwrite,
+            WriteMode::Overwrite,
             None,
-            "write_note concepts/foo.md",
+            Some("write_note concepts/foo.md"),
         )
         .await
         .unwrap();
@@ -188,9 +188,18 @@ async fn e2e_move_note_with_link_updates_one_commit() {
     let tools = server.get_active_write_tools_test().await.unwrap();
     let mgr = server.get_active_vault_manager_test().await.unwrap();
 
-    tools.write_file("old.md", "# Old\n").await.unwrap();
     tools
-        .write_file("linker.md", "see [[old]] here\n")
+        .write_file("old.md", "# Old\n", WriteMode::Overwrite, None, None)
+        .await
+        .unwrap();
+    tools
+        .write_file(
+            "linker.md",
+            "see [[old]] here\n",
+            WriteMode::Overwrite,
+            None,
+            None,
+        )
         .await
         .unwrap();
     // Ensure the link graph reflects the just-committed writes before
@@ -242,9 +251,18 @@ async fn e2e_delete_note_rewrite_stale_callout_atomic() {
     let tools = server.get_active_write_tools_test().await.unwrap();
     let mgr = server.get_active_vault_manager_test().await.unwrap();
 
-    tools.write_file("doomed.md", "# Doomed").await.unwrap();
     tools
-        .write_file("a.md", "see [[doomed]] for details\n")
+        .write_file("doomed.md", "# Doomed", WriteMode::Overwrite, None, None)
+        .await
+        .unwrap();
+    tools
+        .write_file(
+            "a.md",
+            "see [[doomed]] for details\n",
+            WriteMode::Overwrite,
+            None,
+            None,
+        )
         .await
         .unwrap();
     // Same sleep+flush+initialize pattern as the move test (drainer
@@ -274,7 +292,10 @@ async fn e2e_batch_execute_per_op_cas_aborts_atomically() {
     let (tmp, _name, server) = setup_git_vault().await;
     let tools = server.get_active_write_tools_test().await.unwrap();
 
-    tools.write_file("a.md", "v1\n").await.unwrap();
+    tools
+        .write_file("a.md", "v1\n", WriteMode::Overwrite, None, None)
+        .await
+        .unwrap();
     let stale = VaultRepo::blob_oid_of(b"NEVER").unwrap().to_string();
     let head_before = head_oid(tmp.path()).unwrap();
 
@@ -436,11 +457,23 @@ async fn e2e_reindex_queue_drains_after_substrate_writes() {
     let tools = server.get_active_write_tools_test().await.unwrap();
 
     tools
-        .write_file("home.md", "see [[concept-x]]\n")
+        .write_file(
+            "home.md",
+            "see [[concept-x]]\n",
+            WriteMode::Overwrite,
+            None,
+            None,
+        )
         .await
         .unwrap();
     tools
-        .write_file("concept-x.md", "# Concept X\n")
+        .write_file(
+            "concept-x.md",
+            "# Concept X\n",
+            WriteMode::Overwrite,
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -468,7 +501,10 @@ async fn e2e_remove_vault_cleans_up_git_backend_state() {
     // Drive one write so the lazy drainer + ref listener spawn,
     // and the lock/queue entries materialize.
     let tools = server.get_active_write_tools_test().await.unwrap();
-    tools.write_file("seed.md", "seed\n").await.unwrap();
+    tools
+        .write_file("seed.md", "seed\n", WriteMode::Overwrite, None, None)
+        .await
+        .unwrap();
     server
         .spawn_ref_listener_with_interval_test(name, Duration::from_millis(50))
         .await;
@@ -520,7 +556,10 @@ async fn e2e_remove_vault_blocked_while_fanout_active() {
 
     // Bring up the drainer + lock entries with a seed write.
     let tools = server.get_active_write_tools_test().await.unwrap();
-    tools.write_file("seed.md", "seed\n").await.unwrap();
+    tools
+        .write_file("seed.md", "seed\n", WriteMode::Overwrite, None, None)
+        .await
+        .unwrap();
 
     // Open a fanout worktree directly through the substrate-side
     // path so the e2e test doesn't depend on the full
@@ -579,12 +618,12 @@ async fn e2e_update_frontmatter_routed_through_substrate() {
     // Seed a note via the substrate so HEAD has a known starting point.
     let write_tools = server.get_active_write_tools_test().await.unwrap();
     write_tools
-        .write_file_with_mode_and_message(
+        .write_file(
             "notes/sample.md",
             "---\ntags: [a]\n---\nbody\n",
-            turbovault_tools::WriteMode::Overwrite,
+            WriteMode::Overwrite,
             None,
-            "seed sample",
+            Some("seed sample"),
         )
         .await
         .unwrap();
@@ -604,12 +643,12 @@ async fn e2e_update_frontmatter_routed_through_substrate() {
         .await
         .unwrap();
     write_tools
-        .write_file_with_mode_and_message(
+        .write_file(
             "notes/sample.md",
             &new_content,
-            turbovault_tools::WriteMode::Overwrite,
+            WriteMode::Overwrite,
             None,
-            "update_frontmatter notes/sample.md",
+            Some("update_frontmatter notes/sample.md"),
         )
         .await
         .unwrap();
@@ -667,10 +706,10 @@ async fn e2e_create_from_template_routed_through_substrate() {
         .unwrap();
     let write_tools = server.get_active_write_tools_test().await.unwrap();
     write_tools
-        .create_file_with_message(
+        .create_file(
             "templated/n.md",
             &full_content,
-            "create_from_template t1 -> templated/n.md",
+            Some("create_from_template t1 -> templated/n.md"),
         )
         .await
         .unwrap();

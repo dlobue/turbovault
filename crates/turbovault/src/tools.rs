@@ -1726,17 +1726,17 @@ impl ObsidianMcpServer {
                 )));
             }
             tools
-                .create_file_with_message(&path, &content, &msg)
+                .create_file(&path, &content, Some(msg.as_str()))
                 .await
                 .map_err(to_mcp_error)?;
         } else {
             tools
-                .write_file_with_mode_and_message(
+                .write_file(
                     &path,
                     &content,
                     write_mode,
                     expected_hash.as_deref(),
-                    &msg,
+                    Some(msg.as_str()),
                 )
                 .await
                 .map_err(to_mcp_error)?;
@@ -1778,7 +1778,13 @@ impl ObsidianMcpServer {
             .resolve_commit_message(commit_message, || format!("edit_note {}", path))
             .await?;
         let result = tools
-            .edit_file_with_message(&path, &edits, expected_hash.as_deref(), dry_run, &msg)
+            .edit_file(
+                &path,
+                &edits,
+                expected_hash.as_deref(),
+                dry_run,
+                Some(msg.as_str()),
+            )
             .await
             .map_err(to_mcp_error)?;
 
@@ -1879,7 +1885,7 @@ impl ObsidianMcpServer {
             result.link_sources_updated
         } else {
             tools
-                .delete_file_with_hash_and_message(&path, expected_hash.as_deref(), &msg)
+                .delete_file(&path, expected_hash.as_deref(), Some(msg.as_str()))
                 .await
                 .map_err(to_mcp_error)?;
             Vec::new()
@@ -1946,7 +1952,7 @@ impl ObsidianMcpServer {
         } else {
             // Legacy rename-only path. Links will dangle.
             tools
-                .move_file_with_hash_and_message(&from, &to, expected_hash.as_deref(), &msg)
+                .move_file(&from, &to, expected_hash.as_deref(), Some(msg.as_str()))
                 .await
                 .map_err(to_mcp_error)?;
             Vec::new()
@@ -2643,28 +2649,25 @@ impl ObsidianMcpServer {
         fields: String, // JSON string
         commit_message: Option<String>,
     ) -> McpResult<serde_json::Value> {
-        let (vault_name, manager) = self.get_vault_pair().await?;
-        let engine = TemplateEngine::new(manager);
-
+        let vault_name = self.get_active_vault_name().await?;
         let field_values: HashMap<String, String> = serde_json::from_str(&fields)
             .map_err(|e| McpError::invalid_request(format!("Invalid fields JSON: {}", e)))?;
 
-        let (full_content, info) = engine
-            .compute_from_template(&template_id, &file_path, field_values)
-            .await
-            .map_err(to_mcp_error)?;
-
-        // turbovault-gje: route the new-file write through WriteTools so
-        // the git backend records the template-rendered note as a commit
-        // instead of bypassing the substrate via VaultManager.
         let write_tools = self.get_active_write_tools().await?;
         let msg = self
             .resolve_commit_message(commit_message, || {
                 format!("create_from_template {} -> {}", template_id, file_path)
             })
             .await?;
-        write_tools
-            .create_file_with_message(&file_path, &full_content, &msg)
+        // turbovault-nbl.14: render + write live on the tool layer.
+        let info = write_tools
+            .create_from_template(
+                &template_id,
+                &file_path,
+                &field_values,
+                None,
+                Some(msg.as_str()),
+            )
             .await
             .map_err(to_mcp_error)?;
 
@@ -3553,26 +3556,16 @@ impl ObsidianMcpServer {
         merge: Option<bool>,
         commit_message: Option<String>,
     ) -> McpResult<serde_json::Value> {
-        let (vault_name, manager) = self.get_vault_pair().await?;
-        let tools = MetadataTools::new(manager);
-
-        let fm_map: serde_json::Map<String, serde_json::Value> = frontmatter.into_iter().collect();
-        let (new_content, info) = tools
-            .compute_update_frontmatter(&path, fm_map, merge.unwrap_or(true))
-            .await
-            .map_err(to_mcp_error)?;
-
-        // turbovault-gje: route the write through WriteTools so the git
-        // backend records this mutation as a commit instead of bypassing
-        // the substrate via VaultManager::write_file. Legacy backend
-        // behavior is preserved (WriteTools::Legacy still calls
-        // VaultManager directly).
+        let vault_name = self.get_active_vault_name().await?;
         let write_tools = self.get_active_write_tools().await?;
         let msg = self
             .resolve_commit_message(commit_message, || format!("update_frontmatter {}", path))
             .await?;
-        write_tools
-            .write_file_with_mode_and_message(&path, &new_content, WriteMode::Overwrite, None, &msg)
+        // turbovault-nbl.14: compute + write now live on the tool layer; the MCP
+        // tool is a thin delegator. (`None` expected_hash preserves today's
+        // behavior — the precondition is wired in the cutover.)
+        let info = write_tools
+            .update_frontmatter(&path, &frontmatter, merge, None, Some(msg.as_str()))
             .await
             .map_err(to_mcp_error)?;
 
@@ -3602,34 +3595,26 @@ impl ObsidianMcpServer {
         tags: Option<Vec<String>>,
         commit_message: Option<String>,
     ) -> McpResult<serde_json::Value> {
-        let (vault_name, manager) = self.get_vault_pair().await?;
-        let tools = MetadataTools::new(manager);
-
-        let (maybe_write, info) = tools
-            .compute_manage_tags(&path, &operation, tags.as_deref())
-            .await
-            .map_err(to_mcp_error)?;
-
-        // turbovault-gje: route mutations through WriteTools so the git
-        // backend records add/remove as commits. `list` is read-only —
-        // `maybe_write` is `None` — and skips the write path entirely.
-        if let Some(new_content) = maybe_write {
-            let write_tools = self.get_active_write_tools().await?;
-            let msg = self
-                .resolve_commit_message(commit_message, || {
+        let vault_name = self.get_active_vault_name().await?;
+        let write_tools = self.get_active_write_tools().await?;
+        // `list` is read-only: no commit message required, no cache invalidation.
+        let is_write = operation != "list";
+        let msg = if is_write {
+            Some(
+                self.resolve_commit_message(commit_message, || {
                     format!("manage_tags {} {}", operation, path)
                 })
-                .await?;
-            write_tools
-                .write_file_with_mode_and_message(
-                    &path,
-                    &new_content,
-                    WriteMode::Overwrite,
-                    None,
-                    &msg,
-                )
-                .await
-                .map_err(to_mcp_error)?;
+                .await?,
+            )
+        } else {
+            None
+        };
+        // turbovault-nbl.14: compute + write live on the tool layer.
+        let info = write_tools
+            .manage_tags(&path, &operation, tags.as_deref(), None, msg.as_deref())
+            .await
+            .map_err(to_mcp_error)?;
+        if is_write {
             self.invalidate_similarity_cache().await;
             self.invalidate_search_cache().await;
         }
@@ -3705,7 +3690,7 @@ impl ObsidianMcpServer {
             .resolve_commit_message(commit_message, || format!("move_file {} -> {}", from, to))
             .await?;
         tools
-            .move_file_with_hash_and_message(&from, &to, expected_hash.as_deref(), &msg)
+            .move_file(&from, &to, expected_hash.as_deref(), Some(msg.as_str()))
             .await
             .map_err(to_mcp_error)?;
 

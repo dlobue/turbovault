@@ -82,16 +82,28 @@ async fn disjoint_writers_both_succeed() {
 
     let ja = tokio::spawn(async move {
         for i in 0..20 {
-            a.write_file(&format!("a_{i}.md"), &format!("AAA {i}"))
-                .await
-                .unwrap();
+            a.write_file(
+                &format!("a_{i}.md"),
+                &format!("AAA {i}"),
+                WriteMode::Overwrite,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         }
     });
     let jb = tokio::spawn(async move {
         for i in 0..20 {
-            b.write_file(&format!("b_{i}.md"), &format!("BBB {i}"))
-                .await
-                .unwrap();
+            b.write_file(
+                &format!("b_{i}.md"),
+                &format!("BBB {i}"),
+                WriteMode::Overwrite,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         }
     });
     ja.await.unwrap();
@@ -113,7 +125,9 @@ async fn same_file_cas_one_wins_other_aborts() {
 
     // Seed v1 so both writers can compute a (stale-by-the-time-of-write)
     // blob oid for the precondition.
-    a.write_file("a.md", "v1").await.unwrap();
+    a.write_file("a.md", "v1", WriteMode::Overwrite, None, None)
+        .await
+        .unwrap();
     let v1_blob = VaultRepo::blob_oid_of(b"v1").unwrap().to_string();
 
     // Both writers attempt to update a.md from v1, concurrently. The
@@ -121,11 +135,11 @@ async fn same_file_cas_one_wins_other_aborts() {
     let v1a = v1_blob.clone();
     let v1b = v1_blob.clone();
     let ja = tokio::spawn(async move {
-        a.write_file_with_mode("a.md", "WA", WriteMode::Overwrite, Some(&v1a))
+        a.write_file("a.md", "WA", WriteMode::Overwrite, Some(&v1a), None)
             .await
     });
     let jb = tokio::spawn(async move {
-        b.write_file_with_mode("a.md", "WB", WriteMode::Overwrite, Some(&v1b))
+        b.write_file("a.md", "WB", WriteMode::Overwrite, Some(&v1b), None)
             .await
     });
     let ra = ja.await.unwrap();
@@ -155,16 +169,19 @@ async fn reconsideration_domino_aborts_whole_batch_on_read_set_change() {
     let tmp = TempDir::new().unwrap();
     let (_mgr, a, b, _q) = two_writers(&tmp);
 
-    a.write_file("watched.md", "W1").await.unwrap();
+    a.write_file("watched.md", "W1", WriteMode::Overwrite, None, None)
+        .await
+        .unwrap();
     let watched_v1 = VaultRepo::blob_oid_of(b"W1").unwrap();
 
     // Writer B races and modifies "watched.md" first.
     let watched_v1_str = watched_v1.to_string();
-    b.write_file_with_mode(
+    b.write_file(
         "watched.md",
         "W2",
         WriteMode::Overwrite,
         Some(&watched_v1_str),
+        None,
     )
     .await
     .unwrap();
@@ -222,10 +239,22 @@ async fn move_with_link_updates_lands_as_one_commit() {
         hook,
     );
 
-    tools.write_file("old.md", "body").await.unwrap();
-    tools.write_file("link1.md", "see [[old]]").await.unwrap();
     tools
-        .write_file("link2.md", "ref [[old]] here")
+        .write_file("old.md", "body", WriteMode::Overwrite, None, None)
+        .await
+        .unwrap();
+    tools
+        .write_file("link1.md", "see [[old]]", WriteMode::Overwrite, None, None)
+        .await
+        .unwrap();
+    tools
+        .write_file(
+            "link2.md",
+            "ref [[old]] here",
+            WriteMode::Overwrite,
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -289,12 +318,16 @@ async fn reindex_queue_receives_every_commit_under_contention() {
     // Two writers, distinct files, 25 each — all should land in the queue.
     let ja = tokio::spawn(async move {
         for i in 0..25 {
-            a.write_file(&format!("a_{i}.md"), "x").await.unwrap();
+            a.write_file(&format!("a_{i}.md"), "x", WriteMode::Overwrite, None, None)
+                .await
+                .unwrap();
         }
     });
     let jb = tokio::spawn(async move {
         for i in 0..25 {
-            b.write_file(&format!("b_{i}.md"), "y").await.unwrap();
+            b.write_file(&format!("b_{i}.md"), "y", WriteMode::Overwrite, None, None)
+                .await
+                .unwrap();
         }
     });
     ja.await.unwrap();

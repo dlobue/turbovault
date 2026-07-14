@@ -57,6 +57,17 @@ pub type CasCollisionFlush = Arc<dyn Fn() -> BoxFuture<'static, Result<()>> + Se
 /// guarded by `cas::tests::reused_handle_detects_external_ref_advance_no_lost_update`).
 pub type CachedRepo = Arc<std::sync::Mutex<VaultRepo>>;
 
+/// Commit subject for a single-path op: the caller's `message`, else the
+/// auto-derived `"<verb> <path>"`. This is the tool layer's long-standing
+/// default for callers that pass no message (it consolidates the old per-method
+/// `format!("write_file {}", path)` derivations); the MCP layer still derives
+/// and passes its own subject explicitly.
+fn subject(message: Option<&str>, verb: &str, path: &str) -> String {
+    message
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{verb} {path}"))
+}
+
 /// Write-side tools backed by the git substrate.
 ///
 /// Holds the vault path + a shared `CommitLocks` registry rather than an
@@ -195,54 +206,30 @@ impl GitFileTools {
 
     // -------- Writes (route through VaultRepo) --------
 
-    /// Write a file — overwrite by default, append/prepend for the other
-    /// modes (mirrors [`crate::FileTools::write_file_with_mode`]).
+    /// Write a file. Overwrite by default; `mode` selects append/prepend.
     ///
     /// `expected_hash`, when present, must be a **git blob oid hex string**
-    /// (40 hex chars). The substrate's version token is the blob oid (not a
-    /// SHA-256 content hash). A non-Oid string is rejected loudly rather than
-    /// silently dropping CAS protection.
-    pub async fn write_file_with_mode(
+    /// (40 hex chars) — the substrate's version token is the blob oid (not a
+    /// SHA-256 content hash); a non-Oid string is rejected loudly rather than
+    /// silently dropping CAS protection. `message` overrides the auto-derived
+    /// commit subject (`write_file <path>`).
+    pub async fn write_file(
         &self,
         path: &str,
         content: &str,
         mode: WriteMode,
         expected_hash: Option<&str>,
-    ) -> Result<()> {
-        // v3b.1: delegate to the _with_message variant with the auto-derived
-        // subject rather than duplicating the body.
-        self.write_file_with_mode_and_message(
-            path,
-            content,
-            mode,
-            expected_hash,
-            &format!("write_file {}", path),
-        )
-        .await
-    }
-
-    /// turbovault-0bh: caller-supplied commit message variant of
-    /// [`Self::write_file_with_mode`]. Substrate auto-derives the message
-    /// otherwise (`write_file <path>`); this override lets the MCP layer
-    /// pass a richer message (caller's text + verb=tool_name per TV-008).
-    pub async fn write_file_with_mode_and_message(
-        &self,
-        path: &str,
-        content: &str,
-        mode: WriteMode,
-        expected_hash: Option<&str>,
-        message: &str,
+        message: Option<&str>,
     ) -> Result<()> {
         let final_content = self.resolve_write_content(path, content, mode).await?;
         let expected = parse_blob_oid(expected_hash)?;
-        let txn = build_upsert_txn(message.to_string(), path, &final_content, expected);
+        let txn = build_upsert_txn(
+            subject(message, "write_file", path),
+            path,
+            &final_content,
+            expected,
+        );
         self.apply_txn(&txn).await
-    }
-
-    /// Overwrite shortcut — equivalent to `write_file_with_mode(.., Overwrite, None)`.
-    pub async fn write_file(&self, path: &str, content: &str) -> Result<()> {
-        self.write_file_with_mode(path, content, WriteMode::Overwrite, None)
-            .await
     }
 
     /// Strict create: write a NEW file with an `expect_absent` precondition.
@@ -254,21 +241,14 @@ impl GitFileTools {
     /// CAS-by-default: even with parallel subagents racing to create the
     /// same absent path, exactly one commit lands; the loser sees a loud
     /// ConcurrencyError and re-decides.
-    pub async fn create_file(&self, path: &str, content: &str) -> Result<()> {
-        self.create_file_with_message(path, content, &format!("create_file {}", path))
-            .await
-    }
-
-    /// turbovault-0bh: caller-supplied commit message variant of
-    /// [`Self::create_file`]. The `message` becomes the commit subject (and
-    /// body, when newline-separated). All other semantics are identical.
-    pub async fn create_file_with_message(
+    pub async fn create_file(
         &self,
         path: &str,
         content: &str,
-        message: &str,
+        message: Option<&str>,
     ) -> Result<()> {
-        let txn = Changeset::new(message.to_string()).create(path, content.as_bytes().to_vec());
+        let txn = Changeset::new(subject(message, "create_file", path))
+            .create(path, content.as_bytes().to_vec());
         self.apply_txn(&txn).await
     }
 
@@ -281,37 +261,14 @@ impl GitFileTools {
         edits: &str,
         expected_hash: Option<&str>,
         dry_run: bool,
-    ) -> Result<EditResult> {
-        // v3b.1: delegate to the _with_message variant with the auto-derived
-        // subject rather than duplicating the read/parse/apply/hash body.
-        self.edit_file_with_message(
-            path,
-            edits,
-            expected_hash,
-            dry_run,
-            &format!("edit_file {}", path),
-        )
-        .await
-    }
-
-    /// turbovault-0bh: caller-supplied commit message variant of
-    /// [`Self::edit_file`]. Behaviorally identical except the commit
-    /// subject is the caller's message instead of the auto-derived
-    /// `edit_file <path>`.
-    pub async fn edit_file_with_message(
-        &self,
-        path: &str,
-        edits: &str,
-        expected_hash: Option<&str>,
-        dry_run: bool,
-        message: &str,
+        message: Option<&str>,
     ) -> Result<EditResult> {
         let expected = parse_blob_oid(expected_hash)?;
         let current = self.read_file(path).await?;
         let engine = EditEngine::new();
         let blocks = engine.parse_blocks(edits)?;
         let (mut result, new_content) = engine.apply_edits(&current, &blocks, dry_run)?;
-        // 6sj: blob-OID hashes; same as edit_file.
+        // 6sj: blob-OID hashes.
         result.old_hash = VaultRepo::blob_oid_of(current.as_bytes())
             .map_err(|e| Error::config_error(format!("blob_oid_of(current): {}", e)))?
             .to_string();
@@ -321,43 +278,26 @@ impl GitFileTools {
         if dry_run {
             return Ok(result);
         }
-        let txn = build_upsert_txn(message.to_string(), path, &new_content, expected);
+        let txn = build_upsert_txn(
+            subject(message, "edit_file", path),
+            path,
+            &new_content,
+            expected,
+        );
         self.apply_txn(&txn).await?;
         Ok(result)
     }
 
     /// Delete a file. `expected_hash` (blob oid hex) enforces a CAS
-    /// precondition — pass `None` for a blind delete.
-    pub async fn delete_file(&self, path: &str) -> Result<()> {
-        self.delete_file_with_hash(path, None).await
-    }
-
-    /// Delete with optional blob-oid CAS.
-    pub async fn delete_file_with_hash(
+    /// precondition — omit it for a blind delete.
+    pub async fn delete_file(
         &self,
         path: &str,
         expected_hash: Option<&str>,
-    ) -> Result<()> {
-        // v3b.1: delegate to the _with_message variant with the auto-derived
-        // subject rather than duplicating the body.
-        self.delete_file_with_hash_and_message(
-            path,
-            expected_hash,
-            &format!("delete_file {}", path),
-        )
-        .await
-    }
-
-    /// turbovault-0bh: caller-supplied commit message variant of
-    /// [`Self::delete_file_with_hash`].
-    pub async fn delete_file_with_hash_and_message(
-        &self,
-        path: &str,
-        expected_hash: Option<&str>,
-        message: &str,
+        message: Option<&str>,
     ) -> Result<()> {
         let expected = parse_blob_oid(expected_hash)?;
-        let mut txn = Changeset::new(message.to_string()).remove(path);
+        let mut txn = Changeset::new(subject(message, "delete_file", path)).remove(path);
         if let Some(oid) = expected {
             txn = txn.expect_blob(path, oid);
         }
@@ -365,39 +305,22 @@ impl GitFileTools {
     }
 
     /// Move a file — `remove(from) + upsert(to, bytes)` in one commit.
-    pub async fn move_file(&self, from: &str, to: &str) -> Result<()> {
-        self.move_file_with_hash(from, to, None).await
-    }
-
-    /// Move with optional blob-oid CAS on the source path.
-    pub async fn move_file_with_hash(
+    /// `expected_hash` guards the SOURCE; the destination is always
+    /// `expect_absent` (refuses to clobber). A caller-controllable destination
+    /// precondition arrives in the precondition cutover (Commit B).
+    pub async fn move_file(
         &self,
         from: &str,
         to: &str,
         expected_hash: Option<&str>,
-    ) -> Result<()> {
-        self.move_file_with_hash_and_message(
-            from,
-            to,
-            expected_hash,
-            &format!("move_file {} -> {}", from, to),
-        )
-        .await
-    }
-
-    /// turbovault-0bh: caller-supplied commit message variant of
-    /// [`Self::move_file_with_hash`].
-    pub async fn move_file_with_hash_and_message(
-        &self,
-        from: &str,
-        to: &str,
-        expected_hash: Option<&str>,
-        message: &str,
+        message: Option<&str>,
     ) -> Result<()> {
         let expected_from = parse_blob_oid(expected_hash)?;
         let content = self.read_file(from).await?;
-
-        let mut txn = Changeset::new(message.to_string())
+        let subject = message
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("move_file {from} -> {to}"));
+        let mut txn = Changeset::new(subject)
             .remove(from)
             .upsert(to, content.into_bytes());
         if let Some(oid) = expected_from {
@@ -406,6 +329,88 @@ impl GitFileTools {
         // Destination is always required to be absent — refuses to clobber.
         txn = txn.expect_absent(to);
         self.apply_txn(&txn).await
+    }
+
+    // -------- In-place metadata ops (turbovault-nbl.14: moved off the MCP
+    // blind-overwrite kludge / the batch fold onto the tool layer). Each
+    // computes the new content (backend-agnostic read + transform via the pure
+    // `compute_*` helpers) then writes it through the collapsed write surface.
+    // `compute_*` reads the working tree first, so an absent target surfaces as
+    // `FileNotFound` (the desired NoFile) rather than a silent create. Returns
+    // the op's info JSON for the MCP response. `expected_hash` is threaded now
+    // for the precondition cutover (Commit B); today's MCP callers pass `None`.
+
+    /// Merge/replace frontmatter keys on a note.
+    pub async fn update_frontmatter(
+        &self,
+        path: &str,
+        frontmatter: &std::collections::HashMap<String, serde_json::Value>,
+        merge: Option<bool>,
+        expected_hash: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let mt = crate::MetadataTools::new(Arc::clone(&self.manager));
+        let fm_map: serde_json::Map<String, serde_json::Value> =
+            frontmatter.clone().into_iter().collect();
+        let (new_content, info) = mt
+            .compute_update_frontmatter(path, fm_map, merge.unwrap_or(true))
+            .await?;
+        self.write_file(
+            path,
+            &new_content,
+            WriteMode::Overwrite,
+            expected_hash,
+            message,
+        )
+        .await?;
+        Ok(info)
+    }
+
+    /// Add/remove/list tags on a note. `list` is read-only (no write).
+    pub async fn manage_tags(
+        &self,
+        path: &str,
+        operation: &str,
+        tags: Option<&[String]>,
+        expected_hash: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let mt = crate::MetadataTools::new(Arc::clone(&self.manager));
+        let (maybe_write, info) = mt.compute_manage_tags(path, operation, tags).await?;
+        if let Some(new_content) = maybe_write {
+            self.write_file(
+                path,
+                &new_content,
+                WriteMode::Overwrite,
+                expected_hash,
+                message,
+            )
+            .await?;
+        }
+        Ok(info)
+    }
+
+    /// Create a note by rendering a registered template. `force` overwrites an
+    /// existing target; otherwise it is a strict create (`expect_absent`).
+    pub async fn create_from_template(
+        &self,
+        template_id: &str,
+        path: &str,
+        fields: &std::collections::HashMap<String, String>,
+        force: Option<bool>,
+        message: Option<&str>,
+    ) -> Result<crate::CreatedNoteInfo> {
+        let engine = crate::TemplateEngine::new(Arc::clone(&self.manager));
+        let (content, info) = engine
+            .compute_from_template(template_id, path, fields.clone())
+            .await?;
+        if force.unwrap_or(false) {
+            self.write_file(path, &content, WriteMode::Overwrite, None, message)
+                .await?;
+        } else {
+            self.create_file(path, &content, message).await?;
+        }
+        Ok(info)
     }
 
     /// turbovault-oz6: atomic delete + inbound-wikilink wrap-as-stale.
@@ -1429,7 +1434,10 @@ mod tests {
     #[tokio::test]
     async fn write_file_creates_commit_and_materializes() {
         let (tmp, tools) = setup().await;
-        tools.write_file("a.md", "alpha").await.unwrap();
+        tools
+            .write_file("a.md", "alpha", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("a.md")).unwrap(),
             "alpha"
@@ -1440,8 +1448,14 @@ mod tests {
     #[tokio::test]
     async fn write_file_overwrites_existing() {
         let (_tmp, tools) = setup().await;
-        tools.write_file("a.md", "v1").await.unwrap();
-        tools.write_file("a.md", "v2").await.unwrap();
+        tools
+            .write_file("a.md", "v1", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
+        tools
+            .write_file("a.md", "v2", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         assert_eq!(tools.read_file("a.md").await.unwrap(), "v2");
     }
 
@@ -1452,8 +1466,14 @@ mod tests {
     #[tokio::test]
     async fn cached_repo_path_writes_reuses_and_reads_back() {
         let (tmp, tools) = setup_cached().await;
-        tools.write_file("a.md", "v1").await.unwrap();
-        tools.write_file("a.md", "v2").await.unwrap();
+        tools
+            .write_file("a.md", "v1", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
+        tools
+            .write_file("a.md", "v2", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         assert_eq!(tools.read_file("a.md").await.unwrap(), "v2");
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("a.md")).unwrap(),
@@ -1464,7 +1484,10 @@ mod tests {
             "commit landed via the cached handle"
         );
         // A second distinct file through the same handle also lands.
-        tools.write_file("b.md", "B").await.unwrap();
+        tools
+            .write_file("b.md", "B", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         assert_eq!(tools.read_file("b.md").await.unwrap(), "B");
     }
 
@@ -1473,10 +1496,19 @@ mod tests {
     #[tokio::test]
     async fn cached_repo_path_still_enforces_cas() {
         let (_tmp, tools) = setup_cached().await;
-        tools.write_file("a.md", "v1").await.unwrap();
+        tools
+            .write_file("a.md", "v1", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         let bogus = VaultRepo::blob_oid_of(b"NOPE").unwrap();
         let err = tools
-            .write_file_with_mode("a.md", "v2", WriteMode::Overwrite, Some(&bogus.to_string()))
+            .write_file(
+                "a.md",
+                "v2",
+                WriteMode::Overwrite,
+                Some(&bogus.to_string()),
+                None,
+            )
             .await
             .unwrap_err();
         assert!(
@@ -1498,7 +1530,10 @@ mod tests {
     async fn batch_abort_marks_records_not_applied() {
         let (tmp, tools) = setup().await;
         // Seed an existing file so a stale `expected_hash` forces a CAS abort.
-        tools.write_file("s1.md", "v1").await.unwrap();
+        tools
+            .write_file("s1.md", "v1", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         let stale = VaultRepo::blob_oid_of(b"STALE").unwrap().to_string();
         let ops = vec![
             BatchOperation::CreateNote {
@@ -1582,7 +1617,10 @@ mod tests {
     #[tokio::test]
     async fn batch_move_dest_collision_with_prior_write_is_caught() {
         let (tmp, tools) = setup().await;
-        tools.write_file("src.md", "body").await.unwrap();
+        tools
+            .write_file("src.md", "body", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         let ops = vec![
             BatchOperation::WriteNote {
                 path: "dest.md".to_string(),
@@ -1642,7 +1680,13 @@ mod tests {
     async fn batch_edit_note_multi_block_in_one_commit() {
         let (_tmp, tools) = setup().await;
         tools
-            .write_file("doc.md", "alpha\nbeta\ngamma\n")
+            .write_file(
+                "doc.md",
+                "alpha\nbeta\ngamma\n",
+                WriteMode::Overwrite,
+                None,
+                None,
+            )
             .await
             .unwrap();
         let before = head_oid(&tools);
@@ -1676,7 +1720,10 @@ mod tests {
     #[tokio::test]
     async fn batch_edit_note_stale_hash_aborts() {
         let (_tmp, tools) = setup().await;
-        tools.write_file("doc.md", "x\n").await.unwrap();
+        tools
+            .write_file("doc.md", "x\n", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         let stale = VaultRepo::blob_oid_of(b"STALE").unwrap().to_string();
         let ops = vec![BatchOperation::EditNote {
             path: "doc.md".to_string(),
@@ -1694,7 +1741,13 @@ mod tests {
     async fn batch_update_frontmatter_merges_in_one_commit() {
         let (_tmp, tools) = setup().await;
         tools
-            .write_file("n.md", "---\ntitle: T\n---\nbody\n")
+            .write_file(
+                "n.md",
+                "---\ntitle: T\n---\nbody\n",
+                WriteMode::Overwrite,
+                None,
+                None,
+            )
             .await
             .unwrap();
         let mut fm = std::collections::HashMap::new();
@@ -1725,7 +1778,13 @@ mod tests {
     async fn batch_manage_tags_add_in_one_commit() {
         let (_tmp, tools) = setup().await;
         tools
-            .write_file("t.md", "---\ntitle: T\n---\nbody\n")
+            .write_file(
+                "t.md",
+                "---\ntitle: T\n---\nbody\n",
+                WriteMode::Overwrite,
+                None,
+                None,
+            )
             .await
             .unwrap();
         let ops = vec![BatchOperation::ManageTags {
@@ -1747,7 +1806,13 @@ mod tests {
     async fn batch_manage_tags_list_is_rejected() {
         let (_tmp, tools) = setup().await;
         tools
-            .write_file("t.md", "---\ntags: [a]\n---\n")
+            .write_file(
+                "t.md",
+                "---\ntags: [a]\n---\n",
+                WriteMode::Overwrite,
+                None,
+                None,
+            )
             .await
             .unwrap();
         let ops = vec![BatchOperation::ManageTags {
@@ -1794,7 +1859,10 @@ mod tests {
     #[tokio::test]
     async fn batch_create_from_template_strict_create_aborts_on_collision() {
         let (_tmp, tools) = setup().await;
-        tools.write_file("dup.md", "occupied").await.unwrap();
+        tools
+            .write_file("dup.md", "occupied", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         let mut fields = std::collections::HashMap::new();
         fields.insert("title".to_string(), "X".to_string());
         fields.insert("summary".to_string(), "Y".to_string());
@@ -1819,9 +1887,18 @@ mod tests {
     #[tokio::test]
     async fn batch_move_note_rewrites_backlinks_by_default() {
         let (tmp, tools) = setup().await;
-        tools.write_file("old.md", "# Old\n").await.unwrap();
         tools
-            .write_file("linker.md", "see [[old]] here\n")
+            .write_file("old.md", "# Old\n", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
+        tools
+            .write_file(
+                "linker.md",
+                "see [[old]] here\n",
+                WriteMode::Overwrite,
+                None,
+                None,
+            )
             .await
             .unwrap();
         // Populate the link graph so backlinks resolve (the MCP layer drains
@@ -1854,9 +1931,18 @@ mod tests {
     #[tokio::test]
     async fn batch_move_note_rename_only_when_backlinks_disabled() {
         let (tmp, tools) = setup().await;
-        tools.write_file("old.md", "# Old\n").await.unwrap();
         tools
-            .write_file("linker.md", "see [[old]] here\n")
+            .write_file("old.md", "# Old\n", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
+        tools
+            .write_file(
+                "linker.md",
+                "see [[old]] here\n",
+                WriteMode::Overwrite,
+                None,
+                None,
+            )
             .await
             .unwrap();
         tools.manager.initialize().await.unwrap();
@@ -1881,9 +1967,18 @@ mod tests {
     #[tokio::test]
     async fn batch_delete_note_refuses_backlinked_by_default() {
         let (tmp, tools) = setup().await;
-        tools.write_file("doomed.md", "# Doomed\n").await.unwrap();
         tools
-            .write_file("linker.md", "see [[doomed]]\n")
+            .write_file("doomed.md", "# Doomed\n", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
+        tools
+            .write_file(
+                "linker.md",
+                "see [[doomed]]\n",
+                WriteMode::Overwrite,
+                None,
+                None,
+            )
             .await
             .unwrap();
         tools.manager.initialize().await.unwrap();
@@ -1909,9 +2004,18 @@ mod tests {
     #[tokio::test]
     async fn batch_delete_note_rewrite_stale_wraps_linkers() {
         let (tmp, tools) = setup().await;
-        tools.write_file("doomed.md", "# Doomed\n").await.unwrap();
         tools
-            .write_file("linker.md", "see [[doomed]] here\n")
+            .write_file("doomed.md", "# Doomed\n", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
+        tools
+            .write_file(
+                "linker.md",
+                "see [[doomed]] here\n",
+                WriteMode::Overwrite,
+                None,
+                None,
+            )
             .await
             .unwrap();
         tools.manager.initialize().await.unwrap();
@@ -1935,9 +2039,18 @@ mod tests {
     #[tokio::test]
     async fn batch_delete_note_force_leaves_linkers_broken() {
         let (tmp, tools) = setup().await;
-        tools.write_file("doomed.md", "# Doomed\n").await.unwrap();
         tools
-            .write_file("linker.md", "see [[doomed]] here\n")
+            .write_file("doomed.md", "# Doomed\n", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
+        tools
+            .write_file(
+                "linker.md",
+                "see [[doomed]] here\n",
+                WriteMode::Overwrite,
+                None,
+                None,
+            )
             .await
             .unwrap();
         tools.manager.initialize().await.unwrap();
@@ -1959,11 +2072,20 @@ mod tests {
     #[tokio::test]
     async fn write_file_with_stale_blob_oid_aborts_concurrency_error() {
         let (_tmp, tools) = setup().await;
-        tools.write_file("a.md", "v1").await.unwrap();
+        tools
+            .write_file("a.md", "v1", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         // Use a deliberately wrong blob oid.
         let bogus = VaultRepo::blob_oid_of(b"NOPE").unwrap();
         let err = tools
-            .write_file_with_mode("a.md", "v2", WriteMode::Overwrite, Some(&bogus.to_string()))
+            .write_file(
+                "a.md",
+                "v2",
+                WriteMode::Overwrite,
+                Some(&bogus.to_string()),
+                None,
+            )
             .await
             .unwrap_err();
         assert!(
@@ -1982,7 +2104,7 @@ mod tests {
         // backends.
         let (_tmp, tools) = setup().await;
         let err = tools
-            .write_file_with_mode("a.md", "v1", WriteMode::Overwrite, Some("not-a-hash"))
+            .write_file("a.md", "v1", WriteMode::Overwrite, Some("not-a-hash"), None)
             .await
             .unwrap_err();
         assert!(
@@ -1994,17 +2116,26 @@ mod tests {
     #[tokio::test]
     async fn delete_file_removes_and_commits() {
         let (tmp, tools) = setup().await;
-        tools.write_file("a.md", "x").await.unwrap();
-        tools.delete_file("a.md").await.unwrap();
+        tools
+            .write_file("a.md", "x", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
+        tools.delete_file("a.md", None, None).await.unwrap();
         assert!(!tmp.path().join("a.md").exists());
     }
 
     #[tokio::test]
     async fn move_file_atomic_remove_plus_add_one_commit() {
         let (tmp, tools) = setup().await;
-        tools.write_file("old.md", "body").await.unwrap();
+        tools
+            .write_file("old.md", "body", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         let before = head_oid(&tools);
-        tools.move_file("old.md", "new.md").await.unwrap();
+        tools
+            .move_file("old.md", "new.md", None, None)
+            .await
+            .unwrap();
         assert!(!tmp.path().join("old.md").exists());
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("new.md")).unwrap(),
@@ -2016,9 +2147,18 @@ mod tests {
     #[tokio::test]
     async fn move_file_refuses_to_clobber_existing_destination() {
         let (_tmp, tools) = setup().await;
-        tools.write_file("a.md", "A").await.unwrap();
-        tools.write_file("b.md", "B").await.unwrap();
-        let err = tools.move_file("a.md", "b.md").await.unwrap_err();
+        tools
+            .write_file("a.md", "A", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
+        tools
+            .write_file("b.md", "B", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
+        let err = tools
+            .move_file("a.md", "b.md", None, None)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, Error::ConcurrencyError { .. }),
             "got: {err:?}"
@@ -2031,7 +2171,10 @@ mod tests {
     #[tokio::test]
     async fn copy_file_writes_destination_only() {
         let (_tmp, tools) = setup().await;
-        tools.write_file("a.md", "alpha").await.unwrap();
+        tools
+            .write_file("a.md", "alpha", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         tools.copy_file("a.md", "b.md").await.unwrap();
         assert_eq!(tools.read_file("a.md").await.unwrap(), "alpha");
         assert_eq!(tools.read_file("b.md").await.unwrap(), "alpha");
@@ -2040,19 +2183,31 @@ mod tests {
     #[tokio::test]
     async fn edit_file_search_replace_commits() {
         let (_tmp, tools) = setup().await;
-        tools.write_file("a.md", "hello world\n").await.unwrap();
+        tools
+            .write_file("a.md", "hello world\n", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         let edits = "<<<<<<< SEARCH\nhello world\n=======\nhi world\n>>>>>>> REPLACE\n";
-        tools.edit_file("a.md", edits, None, false).await.unwrap();
+        tools
+            .edit_file("a.md", edits, None, false, None)
+            .await
+            .unwrap();
         assert_eq!(tools.read_file("a.md").await.unwrap(), "hi world\n");
     }
 
     #[tokio::test]
     async fn edit_file_dry_run_does_not_commit() {
         let (_tmp, tools) = setup().await;
-        tools.write_file("a.md", "hello\n").await.unwrap();
+        tools
+            .write_file("a.md", "hello\n", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         let head_before = head_oid(&tools);
         let edits = "<<<<<<< SEARCH\nhello\n=======\nbye\n>>>>>>> REPLACE\n";
-        let _ = tools.edit_file("a.md", edits, None, true).await.unwrap();
+        let _ = tools
+            .edit_file("a.md", edits, None, true, None)
+            .await
+            .unwrap();
         assert_eq!(head_oid(&tools), head_before, "no commit on dry_run");
         assert_eq!(tools.read_file("a.md").await.unwrap(), "hello\n");
     }
@@ -2064,9 +2219,15 @@ mod tests {
     #[tokio::test]
     async fn edit_file_returns_blob_oid_hashes_not_sha256() {
         let (_tmp, tools) = setup().await;
-        tools.write_file("a.md", "hello\n").await.unwrap();
+        tools
+            .write_file("a.md", "hello\n", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         let edits = "<<<<<<< SEARCH\nhello\n=======\nbye\n>>>>>>> REPLACE\n";
-        let result = tools.edit_file("a.md", edits, None, false).await.unwrap();
+        let result = tools
+            .edit_file("a.md", edits, None, false, None)
+            .await
+            .unwrap();
         assert_eq!(
             result.old_hash.len(),
             40,
@@ -2092,14 +2253,20 @@ mod tests {
     #[tokio::test]
     async fn edit_file_new_hash_round_trips_as_expected_hash() {
         let (_tmp, tools) = setup().await;
-        tools.write_file("a.md", "v1\n").await.unwrap();
+        tools
+            .write_file("a.md", "v1\n", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         let edits1 = "<<<<<<< SEARCH\nv1\n=======\nv2\n>>>>>>> REPLACE\n";
-        let r1 = tools.edit_file("a.md", edits1, None, false).await.unwrap();
+        let r1 = tools
+            .edit_file("a.md", edits1, None, false, None)
+            .await
+            .unwrap();
         // Use r1.new_hash as the next expected_hash — must succeed because
         // no concurrent change has touched the file.
         let edits2 = "<<<<<<< SEARCH\nv2\n=======\nv3\n>>>>>>> REPLACE\n";
         let r2 = tools
-            .edit_file("a.md", edits2, Some(&r1.new_hash), false)
+            .edit_file("a.md", edits2, Some(&r1.new_hash), false, None)
             .await
             .unwrap();
         assert_eq!(
@@ -2115,10 +2282,19 @@ mod tests {
     #[tokio::test]
     async fn edit_file_dry_run_hashes_match_real_apply() {
         let (_tmp, tools) = setup().await;
-        tools.write_file("a.md", "hello\n").await.unwrap();
+        tools
+            .write_file("a.md", "hello\n", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         let edits = "<<<<<<< SEARCH\nhello\n=======\nbye\n>>>>>>> REPLACE\n";
-        let dry = tools.edit_file("a.md", edits, None, true).await.unwrap();
-        let live = tools.edit_file("a.md", edits, None, false).await.unwrap();
+        let dry = tools
+            .edit_file("a.md", edits, None, true, None)
+            .await
+            .unwrap();
+        let live = tools
+            .edit_file("a.md", edits, None, false, None)
+            .await
+            .unwrap();
         assert_eq!(dry.old_hash, live.old_hash);
         assert_eq!(dry.new_hash, live.new_hash);
     }
@@ -2128,7 +2304,7 @@ mod tests {
     async fn create_file_writes_absent_path() {
         let (tmp, tools) = setup().await;
         let head_before = head_oid(&tools);
-        tools.create_file("new.md", "fresh\n").await.unwrap();
+        tools.create_file("new.md", "fresh\n", None).await.unwrap();
         assert_eq!(tools.read_file("new.md").await.unwrap(), "fresh\n");
         let head_after = head_oid(&tools).unwrap();
         assert_ne!(Some(head_after), head_before, "create advanced HEAD");
@@ -2145,7 +2321,10 @@ mod tests {
     #[tokio::test]
     async fn batch_write_note_with_stale_expected_hash_aborts_atomically() {
         let (tmp, tools) = setup().await;
-        tools.write_file("a.md", "v1\n").await.unwrap();
+        tools
+            .write_file("a.md", "v1\n", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         let bogus = VaultRepo::blob_oid_of(b"NEVER_HERE").unwrap().to_string();
         let head_before = head_oid(&tools).unwrap();
 
@@ -2181,7 +2360,10 @@ mod tests {
     #[tokio::test]
     async fn batch_write_note_with_matching_expected_hash_lands() {
         let (_tmp, tools) = setup().await;
-        tools.write_file("a.md", "v1\n").await.unwrap();
+        tools
+            .write_file("a.md", "v1\n", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         let current = VaultRepo::blob_oid_of(b"v1\n").unwrap().to_string();
         let head_before = head_oid(&tools);
 
@@ -2202,7 +2384,10 @@ mod tests {
     #[tokio::test]
     async fn batch_create_note_force_true_is_blind_upsert() {
         let (_tmp, tools) = setup().await;
-        tools.write_file("dup.md", "v1\n").await.unwrap();
+        tools
+            .write_file("dup.md", "v1\n", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         let ops = vec![BatchOperation::CreateNote {
             path: "dup.md".into(),
             content: "v2\n".into(),
@@ -2220,10 +2405,13 @@ mod tests {
     #[tokio::test]
     async fn create_file_aborts_on_existing_path() {
         let (tmp, tools) = setup().await;
-        tools.write_file("dup.md", "v1\n").await.unwrap();
+        tools
+            .write_file("dup.md", "v1\n", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         let head_before = head_oid(&tools).unwrap();
 
-        let err = tools.create_file("dup.md", "v2\n").await.unwrap_err();
+        let err = tools.create_file("dup.md", "v2\n", None).await.unwrap_err();
         assert!(
             matches!(err, Error::ConcurrencyError { .. }),
             "expected ConcurrencyError, got: {err:?}"
@@ -2242,10 +2430,22 @@ mod tests {
     async fn batch_execute_one_atomic_commit_all_op_types() {
         let (tmp, tools) = setup().await;
         // Seed for delete + move + update-links.
-        tools.write_file("seed_del.md", "gone").await.unwrap();
-        tools.write_file("seed_mv.md", "moveme").await.unwrap();
         tools
-            .write_file("links.md", "see [[old-target]]")
+            .write_file("seed_del.md", "gone", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
+        tools
+            .write_file("seed_mv.md", "moveme", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
+        tools
+            .write_file(
+                "links.md",
+                "see [[old-target]]",
+                WriteMode::Overwrite,
+                None,
+                None,
+            )
             .await
             .unwrap();
         let head_before = head_oid(&tools);
@@ -2317,7 +2517,10 @@ mod tests {
         // CreateNote on a path that already exists -> precondition abort.
         // Atomicity contract: zero files from the batch should land.
         let (tmp, tools) = setup().await;
-        tools.write_file("exists.md", "already").await.unwrap();
+        tools
+            .write_file("exists.md", "already", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         let head_before = head_oid(&tools);
 
         let ops = vec![
@@ -2387,14 +2590,18 @@ mod tests {
 
         // Trigger a guaranteed precondition failure: write v1, then update
         // with a stale expected blob.
-        tools.write_file("a.md", "v1").await.unwrap();
+        tools
+            .write_file("a.md", "v1", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         let stale_oid = VaultRepo::blob_oid_of(b"WAS_NEVER_HERE").unwrap();
         let err = tools
-            .write_file_with_mode(
+            .write_file(
                 "a.md",
                 "v2",
                 WriteMode::Overwrite,
                 Some(&stale_oid.to_string()),
+                None,
             )
             .await
             .unwrap_err();
@@ -2488,8 +2695,14 @@ mod tests {
             flush,
         );
 
-        tools.write_file("a.md", "alpha").await.unwrap();
-        tools.write_file("b.md", "beta").await.unwrap();
+        tools
+            .write_file("a.md", "alpha", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
+        tools
+            .write_file("b.md", "beta", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         assert_eq!(
             flush_calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -2519,14 +2732,18 @@ mod tests {
             flush,
         );
 
-        tools.write_file("a.md", "v1").await.unwrap();
+        tools
+            .write_file("a.md", "v1", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         let stale_oid = VaultRepo::blob_oid_of(b"WAS_NEVER_HERE").unwrap();
         let err = tools
-            .write_file_with_mode(
+            .write_file(
                 "a.md",
                 "v2",
                 WriteMode::Overwrite,
                 Some(&stale_oid.to_string()),
+                None,
             )
             .await
             .unwrap_err();
@@ -2544,12 +2761,12 @@ mod tests {
     async fn write_file_with_mode_and_message_uses_caller_subject() {
         let (_tmp, tools) = setup().await;
         tools
-            .write_file_with_mode_and_message(
+            .write_file(
                 "a.md",
                 "alpha",
                 WriteMode::Overwrite,
                 None,
-                "add concept page for Alpha",
+                Some("add concept page for Alpha"),
             )
             .await
             .unwrap();
@@ -2561,7 +2778,7 @@ mod tests {
     async fn create_file_with_message_uses_caller_subject() {
         let (_tmp, tools) = setup().await;
         tools
-            .create_file_with_message("new.md", "fresh", "create stub page")
+            .create_file("new.md", "fresh", Some("create stub page"))
             .await
             .unwrap();
         let msg = head_commit_message(&tools);
@@ -2571,10 +2788,13 @@ mod tests {
     #[tokio::test]
     async fn edit_file_with_message_uses_caller_subject() {
         let (_tmp, tools) = setup().await;
-        tools.write_file("a.md", "hello\n").await.unwrap();
+        tools
+            .write_file("a.md", "hello\n", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         let edits = "<<<<<<< SEARCH\nhello\n=======\nbye\n>>>>>>> REPLACE\n";
         let _ = tools
-            .edit_file_with_message("a.md", edits, None, false, "fix greeting")
+            .edit_file("a.md", edits, None, false, Some("fix greeting"))
             .await
             .unwrap();
         let msg = head_commit_message(&tools);
@@ -2584,9 +2804,12 @@ mod tests {
     #[tokio::test]
     async fn delete_file_with_hash_and_message_uses_caller_subject() {
         let (_tmp, tools) = setup().await;
-        tools.write_file("a.md", "v").await.unwrap();
         tools
-            .delete_file_with_hash_and_message("a.md", None, "remove superseded page")
+            .write_file("a.md", "v", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
+        tools
+            .delete_file("a.md", None, Some("remove superseded page"))
             .await
             .unwrap();
         let msg = head_commit_message(&tools);
@@ -2596,9 +2819,12 @@ mod tests {
     #[tokio::test]
     async fn move_file_with_hash_and_message_uses_caller_subject() {
         let (_tmp, tools) = setup().await;
-        tools.write_file("a.md", "v").await.unwrap();
         tools
-            .move_file_with_hash_and_message("a.md", "b.md", None, "rename to canonical slug")
+            .write_file("a.md", "v", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
+        tools
+            .move_file("a.md", "b.md", None, Some("rename to canonical slug"))
             .await
             .unwrap();
         let msg = head_commit_message(&tools);
@@ -2654,9 +2880,18 @@ mod tests {
     #[tokio::test]
     async fn move_with_link_updates_atomic_one_commit() {
         let (tmp, tools) = setup().await;
-        tools.write_file("old.md", "# Old\n").await.unwrap();
         tools
-            .write_file("linker.md", "I link to [[old]] here.\n")
+            .write_file("old.md", "# Old\n", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
+        tools
+            .write_file(
+                "linker.md",
+                "I link to [[old]] here.\n",
+                WriteMode::Overwrite,
+                None,
+                None,
+            )
             .await
             .unwrap();
         // Initialize link graph from the seeded files so backlinks resolve.
@@ -2691,13 +2926,28 @@ mod tests {
     #[tokio::test]
     async fn move_with_link_updates_handles_multiple_sources() {
         let (tmp, tools) = setup().await;
-        tools.write_file("old.md", "# Old\n").await.unwrap();
         tools
-            .write_file("a.md", "see [[old|the page]]\n")
+            .write_file("old.md", "# Old\n", WriteMode::Overwrite, None, None)
             .await
             .unwrap();
         tools
-            .write_file("b.md", "embed: ![[old]]\nsection: [[old#Header]]\n")
+            .write_file(
+                "a.md",
+                "see [[old|the page]]\n",
+                WriteMode::Overwrite,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        tools
+            .write_file(
+                "b.md",
+                "embed: ![[old]]\nsection: [[old#Header]]\n",
+                WriteMode::Overwrite,
+                None,
+                None,
+            )
             .await
             .unwrap();
         // turbovault-34p: a source where "old" is a SUBSTRING of unrelated words
@@ -2705,7 +2955,13 @@ mod tests {
         // ([[keeper]]). A substring/too-greedy rewrite would corrupt these; only
         // the [[old]] wikilink may change.
         tools
-            .write_file("c.md", "golden oldie [[old]] keep [[keeper]]\n")
+            .write_file(
+                "c.md",
+                "golden oldie [[old]] keep [[keeper]]\n",
+                WriteMode::Overwrite,
+                None,
+                None,
+            )
             .await
             .unwrap();
         tools.manager.initialize().await.unwrap();
@@ -2743,13 +2999,19 @@ mod tests {
     async fn git_prepend_after_frontmatter_and_append_at_end() {
         let (tmp, tools) = setup().await;
         tools
-            .write_file("n.md", "---\ntitle: T\n---\n\nbody line\n")
+            .write_file(
+                "n.md",
+                "---\ntitle: T\n---\n\nbody line\n",
+                WriteMode::Overwrite,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
         // Prepend lands below the closing `---`, above the body.
         tools
-            .write_file_with_mode("n.md", "PRE", WriteMode::Prepend, None)
+            .write_file("n.md", "PRE", WriteMode::Prepend, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -2760,7 +3022,7 @@ mod tests {
 
         // Append lands at the very end.
         tools
-            .write_file_with_mode("n.md", "POST", WriteMode::Append, None)
+            .write_file("n.md", "POST", WriteMode::Append, None, None)
             .await
             .unwrap();
         let after = tools.read_file("n.md").await.unwrap();
@@ -2803,7 +3065,10 @@ mod tests {
     #[tokio::test]
     async fn cached_handle_detects_external_ref_advance() {
         let (tmp, tools) = setup_cached().await;
-        tools.write_file("a.md", "v1").await.unwrap();
+        tools
+            .write_file("a.md", "v1", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         let v1 = VaultRepo::blob_oid_of(b"v1").unwrap().to_string();
 
         // Another process advances the ref + rewrites a.md's blob.
@@ -2812,7 +3077,7 @@ mod tests {
         // The cached handle must re-read the ref under lock and REJECT the write
         // carrying the now-stale precondition.
         let err = tools
-            .write_file_with_mode("a.md", "v2", WriteMode::Overwrite, Some(&v1))
+            .write_file("a.md", "v2", WriteMode::Overwrite, Some(&v1), None)
             .await
             .unwrap_err();
         assert!(
@@ -2834,13 +3099,28 @@ mod tests {
     #[tokio::test]
     async fn delete_with_link_rewrite_to_stale_wraps_all_linkers() {
         let (tmp, tools) = setup().await;
-        tools.write_file("doomed.md", "# Doomed").await.unwrap();
         tools
-            .write_file("a.md", "see [[doomed]] for details\n")
+            .write_file("doomed.md", "# Doomed", WriteMode::Overwrite, None, None)
             .await
             .unwrap();
         tools
-            .write_file("b.md", "another ref ![[doomed#Sec]]\n")
+            .write_file(
+                "a.md",
+                "see [[doomed]] for details\n",
+                WriteMode::Overwrite,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        tools
+            .write_file(
+                "b.md",
+                "another ref ![[doomed#Sec]]\n",
+                WriteMode::Overwrite,
+                None,
+                None,
+            )
             .await
             .unwrap();
         tools.manager.initialize().await.unwrap();
@@ -2878,13 +3158,28 @@ mod tests {
     #[tokio::test]
     async fn list_inbound_backlinks_returns_linkers() {
         let (_tmp, tools) = setup().await;
-        tools.write_file("doomed.md", "# Doomed").await.unwrap();
         tools
-            .write_file("linker.md", "see [[doomed]]")
+            .write_file("doomed.md", "# Doomed", WriteMode::Overwrite, None, None)
             .await
             .unwrap();
         tools
-            .write_file("unrelated.md", "no links here")
+            .write_file(
+                "linker.md",
+                "see [[doomed]]",
+                WriteMode::Overwrite,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        tools
+            .write_file(
+                "unrelated.md",
+                "no links here",
+                WriteMode::Overwrite,
+                None,
+                None,
+            )
             .await
             .unwrap();
         tools.manager.initialize().await.unwrap();
@@ -2900,9 +3195,18 @@ mod tests {
     #[tokio::test]
     async fn move_with_link_updates_aborts_on_stale_source() {
         let (tmp, tools) = setup().await;
-        tools.write_file("old.md", "# Old\n").await.unwrap();
         tools
-            .write_file("linker.md", "see [[old]]\n")
+            .write_file("old.md", "# Old\n", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
+        tools
+            .write_file(
+                "linker.md",
+                "see [[old]]\n",
+                WriteMode::Overwrite,
+                None,
+                None,
+            )
             .await
             .unwrap();
         tools.manager.initialize().await.unwrap();

@@ -13,6 +13,7 @@
 use crate::batch_tools::BatchTools;
 use crate::file_tools::{FileTools, NoteInfo, WriteMode};
 use crate::git_file_tools::{CachedRepo, CasCollisionFlush, GitFileTools, MoveWithLinksResult};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use turbovault_batch::{BatchOperation, BatchResult};
@@ -131,12 +132,16 @@ impl WriteTools {
 
     // -------- Writes --------
 
-    pub async fn write_file_with_mode(
+    /// Write a file. The git backend derives a default commit subject when
+    /// `message` is `None`; the legacy backend ignores `message` (legacy writes
+    /// don't produce commits).
+    pub async fn write_file(
         &self,
         path: &str,
         content: &str,
         mode: WriteMode,
         expected_hash: Option<&str>,
+        message: Option<&str>,
     ) -> Result<()> {
         match self {
             Self::Legacy { files, .. } => {
@@ -145,16 +150,9 @@ impl WriteTools {
                     .await
             }
             Self::Git(g) => {
-                g.write_file_with_mode(path, content, mode, expected_hash)
+                g.write_file(path, content, mode, expected_hash, message)
                     .await
             }
-        }
-    }
-
-    pub async fn write_file(&self, path: &str, content: &str) -> Result<()> {
-        match self {
-            Self::Legacy { files, .. } => files.write_file(path, content).await,
-            Self::Git(g) => g.write_file(path, content).await,
         }
     }
 
@@ -165,104 +163,144 @@ impl WriteTools {
     /// CAS fail loudly with `ConcurrencyError`. This is the safety the
     /// MCP layer's pre-check cannot provide on its own (TOCTOU window).
     ///
-    /// **Legacy backend:** delegates to `write_file` (best-effort; legacy
-    /// has no atomic create primitive). The MCP layer's pre-check is the
-    /// only protection — concurrent creates can still race. Known limit of
-    /// the legacy path; documented, not fixed (per the legacy-stays
-    /// direction).
-    pub async fn create_file(&self, path: &str, content: &str) -> Result<()> {
-        match self {
-            Self::Legacy { files, .. } => files.write_file(path, content).await,
-            Self::Git(g) => g.create_file(path, content).await,
-        }
-    }
-
-    // -------- turbovault-0bh: caller-supplied commit message variants --------
-    //
-    // Each `_with_message` method behaves identically to its base sibling
-    // except that on the git backend the caller's `message` becomes the
-    // commit subject (and body, when newline-separated). Legacy backend
-    // silently ignores `message` — legacy writes don't produce commits.
-
-    pub async fn write_file_with_mode_and_message(
+    /// **Legacy backend:** delegates to `write_file` (best-effort; legacy has
+    /// no atomic create primitive). Known limit of the legacy path.
+    pub async fn create_file(
         &self,
         path: &str,
         content: &str,
-        mode: WriteMode,
-        expected_hash: Option<&str>,
-        message: &str,
-    ) -> Result<()> {
-        match self {
-            Self::Legacy { files, .. } => {
-                files
-                    .write_file_with_mode(path, content, mode, expected_hash)
-                    .await
-            }
-            Self::Git(g) => {
-                g.write_file_with_mode_and_message(path, content, mode, expected_hash, message)
-                    .await
-            }
-        }
-    }
-
-    pub async fn create_file_with_message(
-        &self,
-        path: &str,
-        content: &str,
-        message: &str,
+        message: Option<&str>,
     ) -> Result<()> {
         match self {
             Self::Legacy { files, .. } => files.write_file(path, content).await,
-            Self::Git(g) => g.create_file_with_message(path, content, message).await,
+            Self::Git(g) => g.create_file(path, content, message).await,
         }
     }
 
-    pub async fn edit_file_with_message(
+    /// Edit via SEARCH/REPLACE blocks.
+    pub async fn edit_file(
         &self,
         path: &str,
         edits: &str,
         expected_hash: Option<&str>,
         dry_run: bool,
-        message: &str,
+        message: Option<&str>,
     ) -> Result<EditResult> {
         match self {
             Self::Legacy { files, .. } => {
                 files.edit_file(path, edits, expected_hash, dry_run).await
             }
             Self::Git(g) => {
-                g.edit_file_with_message(path, edits, expected_hash, dry_run, message)
+                g.edit_file(path, edits, expected_hash, dry_run, message)
                     .await
             }
         }
     }
 
-    pub async fn delete_file_with_hash_and_message(
+    pub async fn delete_file(
         &self,
         path: &str,
         expected_hash: Option<&str>,
-        message: &str,
+        message: Option<&str>,
     ) -> Result<()> {
         match self {
             Self::Legacy { files, .. } => files.delete_file_with_hash(path, expected_hash).await,
-            Self::Git(g) => {
-                g.delete_file_with_hash_and_message(path, expected_hash, message)
-                    .await
-            }
+            Self::Git(g) => g.delete_file(path, expected_hash, message).await,
         }
     }
 
-    pub async fn move_file_with_hash_and_message(
+    /// Move a file. `expected_hash` guards the source; the destination is always
+    /// `expect_absent` (refuses to clobber).
+    pub async fn move_file(
         &self,
         from: &str,
         to: &str,
         expected_hash: Option<&str>,
-        message: &str,
+        message: Option<&str>,
     ) -> Result<()> {
         match self {
             Self::Legacy { files, .. } => files.move_file_with_hash(from, to, expected_hash).await,
+            Self::Git(g) => g.move_file(from, to, expected_hash, message).await,
+        }
+    }
+
+    // -------- In-place metadata ops (turbovault-nbl.14) --------
+    // Git → the tool-layer method (compute + commit). Legacy → compute
+    // backend-agnostically via `MetadataTools`/`TemplateEngine`, then the
+    // legacy `VaultManager` write (no commit, no CAS — the legacy limit).
+    // Each returns the op's info JSON for the MCP response.
+
+    pub async fn update_frontmatter(
+        &self,
+        path: &str,
+        frontmatter: &HashMap<String, serde_json::Value>,
+        merge: Option<bool>,
+        expected_hash: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        match self {
             Self::Git(g) => {
-                g.move_file_with_hash_and_message(from, to, expected_hash, message)
+                g.update_frontmatter(path, frontmatter, merge, expected_hash, message)
                     .await
+            }
+            Self::Legacy { files, .. } => {
+                let mt = crate::MetadataTools::new(Arc::clone(&files.manager));
+                let fm_map: serde_json::Map<String, serde_json::Value> =
+                    frontmatter.clone().into_iter().collect();
+                let (new_content, info) = mt
+                    .compute_update_frontmatter(path, fm_map, merge.unwrap_or(true))
+                    .await?;
+                files.write_file(path, &new_content).await?;
+                Ok(info)
+            }
+        }
+    }
+
+    pub async fn manage_tags(
+        &self,
+        path: &str,
+        operation: &str,
+        tags: Option<&[String]>,
+        expected_hash: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        match self {
+            Self::Git(g) => {
+                g.manage_tags(path, operation, tags, expected_hash, message)
+                    .await
+            }
+            Self::Legacy { files, .. } => {
+                let mt = crate::MetadataTools::new(Arc::clone(&files.manager));
+                let (maybe_write, info) = mt.compute_manage_tags(path, operation, tags).await?;
+                if let Some(new_content) = maybe_write {
+                    files.write_file(path, &new_content).await?;
+                }
+                Ok(info)
+            }
+        }
+    }
+
+    pub async fn create_from_template(
+        &self,
+        template_id: &str,
+        path: &str,
+        fields: &HashMap<String, String>,
+        force: Option<bool>,
+        message: Option<&str>,
+    ) -> Result<crate::CreatedNoteInfo> {
+        match self {
+            Self::Git(g) => {
+                g.create_from_template(template_id, path, fields, force, message)
+                    .await
+            }
+            Self::Legacy { files, .. } => {
+                let engine = crate::TemplateEngine::new(Arc::clone(&files.manager));
+                let (content, info) = engine
+                    .compute_from_template(template_id, path, fields.clone())
+                    .await?;
+                // Legacy has no atomic create; best-effort write (force is moot).
+                files.write_file(path, &content).await?;
+                Ok(info)
             }
         }
     }
@@ -349,58 +387,6 @@ impl WriteTools {
                 batch.batch_execute(operations).await
             }
             Self::Git(g) => g.batch_execute_with_message(operations, message).await,
-        }
-    }
-
-    pub async fn edit_file(
-        &self,
-        path: &str,
-        edits: &str,
-        expected_hash: Option<&str>,
-        dry_run: bool,
-    ) -> Result<EditResult> {
-        match self {
-            Self::Legacy { files, .. } => {
-                files.edit_file(path, edits, expected_hash, dry_run).await
-            }
-            Self::Git(g) => g.edit_file(path, edits, expected_hash, dry_run).await,
-        }
-    }
-
-    pub async fn delete_file(&self, path: &str) -> Result<()> {
-        match self {
-            Self::Legacy { files, .. } => files.delete_file(path).await,
-            Self::Git(g) => g.delete_file(path).await,
-        }
-    }
-
-    pub async fn delete_file_with_hash(
-        &self,
-        path: &str,
-        expected_hash: Option<&str>,
-    ) -> Result<()> {
-        match self {
-            Self::Legacy { files, .. } => files.delete_file_with_hash(path, expected_hash).await,
-            Self::Git(g) => g.delete_file_with_hash(path, expected_hash).await,
-        }
-    }
-
-    pub async fn move_file(&self, from: &str, to: &str) -> Result<()> {
-        match self {
-            Self::Legacy { files, .. } => files.move_file(from, to).await,
-            Self::Git(g) => g.move_file(from, to).await,
-        }
-    }
-
-    pub async fn move_file_with_hash(
-        &self,
-        from: &str,
-        to: &str,
-        expected_hash: Option<&str>,
-    ) -> Result<()> {
-        match self {
-            Self::Legacy { files, .. } => files.move_file_with_hash(from, to, expected_hash).await,
-            Self::Git(g) => g.move_file_with_hash(from, to, expected_hash).await,
         }
     }
 
@@ -513,7 +499,10 @@ mod tests {
     async fn legacy_dispatch_writes_and_reads_back() {
         let tmp = TempDir::new().unwrap();
         let tools = legacy_tools(&tmp).await;
-        tools.write_file("a.md", "alpha").await.unwrap();
+        tools
+            .write_file("a.md", "alpha", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         assert_eq!(tools.read_file("a.md").await.unwrap(), "alpha");
     }
 
@@ -521,7 +510,10 @@ mod tests {
     async fn git_dispatch_writes_and_reads_back() {
         let tmp = TempDir::new().unwrap();
         let tools = git_tools(&tmp).await;
-        tools.write_file("a.md", "alpha").await.unwrap();
+        tools
+            .write_file("a.md", "alpha", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         assert_eq!(tools.read_file("a.md").await.unwrap(), "alpha");
         // Git backend → commit landed (HEAD points somewhere).
         let repo = git2::Repository::open(tmp.path()).unwrap();
@@ -535,8 +527,11 @@ mod tests {
     async fn git_create_file_aborts_on_existing_path() {
         let tmp = TempDir::new().unwrap();
         let tools = git_tools(&tmp).await;
-        tools.write_file("dup.md", "v1").await.unwrap();
-        let err = tools.create_file("dup.md", "v2").await.unwrap_err();
+        tools
+            .write_file("dup.md", "v1", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
+        let err = tools.create_file("dup.md", "v2", None).await.unwrap_err();
         assert!(
             matches!(err, Error::ConcurrencyError { .. }),
             "got: {err:?}"
@@ -619,9 +614,12 @@ mod tests {
     async fn legacy_create_file_is_blind_fallback() {
         let tmp = TempDir::new().unwrap();
         let tools = legacy_tools(&tmp).await;
-        tools.write_file("dup.md", "v1").await.unwrap();
+        tools
+            .write_file("dup.md", "v1", WriteMode::Overwrite, None, None)
+            .await
+            .unwrap();
         // Legacy intentionally allows this — known limit.
-        tools.create_file("dup.md", "v2").await.unwrap();
+        tools.create_file("dup.md", "v2", None).await.unwrap();
         assert_eq!(tools.read_file("dup.md").await.unwrap(), "v2");
     }
 
