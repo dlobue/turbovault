@@ -25,17 +25,8 @@ impl SinglePathOp for DeleteNote {
     }
 
     async fn invoke(&self, world: &World, rel: &str, pc: Precondition) -> Observed {
-        let hash = match &pc {
-            Precondition::ExpectBlob(oid) => Some(oid.clone()),
-            Precondition::ExpectExists => None,
-            Precondition::Blind | Precondition::ExpectAbsent => {
-                unreachable!("delete_note only carries ExpectExists / ExpectBlob")
-            }
-        };
-        let res = world
-            .tools
-            .delete_file_with_hash(rel, hash.as_deref())
-            .await;
+        // nbl.6 cutover: the real op takes the precondition directly.
+        let res = world.tools.delete_file(rel, pc, None).await;
         let after = world.read(rel);
         observe(res, after)
     }

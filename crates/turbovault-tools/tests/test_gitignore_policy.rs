@@ -47,7 +47,13 @@ async fn include_ignored_true_writes_gitignored_path() {
     // Default include_ignored=true: ignored paths commit normally.
     let tools = GitFileTools::new(manager, tmp.path().to_path_buf(), locks);
     let result = tools
-        .create_file("secrets/api.md", "TOKEN=xxx\n", None)
+        .write_file(
+            "secrets/api.md",
+            "TOKEN=xxx\n",
+            turbovault_tools::WriteMode::Overwrite,
+            turbovault_core::Precondition::ExpectAbsent,
+            None,
+        )
         .await;
     assert!(
         result.is_ok(),
@@ -69,7 +75,13 @@ async fn include_ignored_false_refuses_gitignored_path() {
     let tools =
         GitFileTools::new(manager, tmp.path().to_path_buf(), locks).with_include_ignored(false);
     let err = tools
-        .create_file("secrets/api.md", "TOKEN=xxx\n", None)
+        .write_file(
+            "secrets/api.md",
+            "TOKEN=xxx\n",
+            turbovault_tools::WriteMode::Overwrite,
+            turbovault_core::Precondition::ExpectAbsent,
+            None,
+        )
         .await
         .unwrap_err();
     let msg = format!("{}", err);
@@ -93,7 +105,15 @@ async fn include_ignored_false_allows_non_ignored_path() {
 
     let tools =
         GitFileTools::new(manager, tmp.path().to_path_buf(), locks).with_include_ignored(false);
-    let result = tools.create_file("notes/foo.md", "# Foo\n", None).await;
+    let result = tools
+        .write_file(
+            "notes/foo.md",
+            "# Foo\n",
+            turbovault_tools::WriteMode::Overwrite,
+            turbovault_core::Precondition::ExpectAbsent,
+            None,
+        )
+        .await;
     assert!(
         result.is_ok(),
         "include_ignored=false should still allow non-ignored paths, got: {:?}",

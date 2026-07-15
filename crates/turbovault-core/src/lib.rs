@@ -80,6 +80,7 @@ pub mod error;
 pub mod metrics;
 pub mod models;
 pub mod multi_vault;
+pub mod precondition;
 pub mod profiles;
 pub mod resilience;
 pub mod task_parser;
@@ -91,6 +92,7 @@ pub use error::{Error, Result};
 pub use metrics::{Counter, Histogram, HistogramStats, HistogramTimer, MetricsContext};
 pub use models::*;
 pub use multi_vault::{MultiVaultManager, VaultInfo};
+pub use precondition::Precondition;
 pub use profiles::ConfigProfile;
 pub use utils::{
     CSVBuilder, PathValidator, TransactionBuilder, bytes_to_lower_hex, to_json_string,

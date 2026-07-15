@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use turbovault_batch::{BatchOperation, BatchResult};
+use turbovault_core::Precondition;
 use turbovault_core::prelude::*;
 use turbovault_git::{CommitHook, CommitLocks};
 
@@ -150,8 +151,15 @@ impl WriteTools {
                     .await
             }
             Self::Git(g) => {
-                g.write_file(path, content, mode, expected_hash, message)
-                    .await
+                // PATH A (nbl.6): the git arm builds the op-level precondition
+                // from the legacy `expected_hash`. A wholesale write is a blind
+                // overwrite when no token is supplied (None → Blind), or a
+                // CAS-guarded overwrite when one is (Some → ExpectBlob) —
+                // behavior-identical to the pre-cutover `Option<&str>` path.
+                let pc = expected_hash
+                    .map(|h| Precondition::ExpectBlob(h.to_string()))
+                    .unwrap_or(Precondition::Blind);
+                g.write_file(path, content, mode, pc, message).await
             }
         }
     }
@@ -173,7 +181,18 @@ impl WriteTools {
     ) -> Result<()> {
         match self {
             Self::Legacy { files, .. } => files.write_file(path, content).await,
-            Self::Git(g) => g.create_file(path, content, message).await,
+            // PATH A (nbl.6): create folds into write_file with ExpectAbsent —
+            // the substrate's expect_absent, i.e. the pre-cutover create_file.
+            Self::Git(g) => {
+                g.write_file(
+                    path,
+                    content,
+                    WriteMode::Overwrite,
+                    Precondition::ExpectAbsent,
+                    message,
+                )
+                .await
+            }
         }
     }
 
@@ -191,8 +210,14 @@ impl WriteTools {
                 files.edit_file(path, edits, expected_hash, dry_run).await
             }
             Self::Git(g) => {
-                g.edit_file(path, edits, expected_hash, dry_run, message)
-                    .await
+                g.edit_file(
+                    path,
+                    edits,
+                    Precondition::for_in_place(expected_hash),
+                    dry_run,
+                    message,
+                )
+                .await
             }
         }
     }
@@ -205,7 +230,10 @@ impl WriteTools {
     ) -> Result<()> {
         match self {
             Self::Legacy { files, .. } => files.delete_file_with_hash(path, expected_hash).await,
-            Self::Git(g) => g.delete_file(path, expected_hash, message).await,
+            Self::Git(g) => {
+                g.delete_file(path, Precondition::for_in_place(expected_hash), message)
+                    .await
+            }
         }
     }
 
@@ -220,7 +248,10 @@ impl WriteTools {
     ) -> Result<()> {
         match self {
             Self::Legacy { files, .. } => files.move_file_with_hash(from, to, expected_hash).await,
-            Self::Git(g) => g.move_file(from, to, expected_hash, message).await,
+            Self::Git(g) => {
+                g.move_file(from, to, Precondition::for_in_place(expected_hash), message)
+                    .await
+            }
         }
     }
 
@@ -240,8 +271,14 @@ impl WriteTools {
     ) -> Result<serde_json::Value> {
         match self {
             Self::Git(g) => {
-                g.update_frontmatter(path, frontmatter, merge, expected_hash, message)
-                    .await
+                g.update_frontmatter(
+                    path,
+                    frontmatter,
+                    merge,
+                    Precondition::for_in_place(expected_hash),
+                    message,
+                )
+                .await
             }
             Self::Legacy { files, .. } => {
                 let mt = crate::MetadataTools::new(Arc::clone(&files.manager));
@@ -266,8 +303,14 @@ impl WriteTools {
     ) -> Result<serde_json::Value> {
         match self {
             Self::Git(g) => {
-                g.manage_tags(path, operation, tags, expected_hash, message)
-                    .await
+                g.manage_tags(
+                    path,
+                    operation,
+                    tags,
+                    Precondition::for_in_place(expected_hash),
+                    message,
+                )
+                .await
             }
             Self::Legacy { files, .. } => {
                 let mt = crate::MetadataTools::new(Arc::clone(&files.manager));
@@ -290,7 +333,15 @@ impl WriteTools {
     ) -> Result<crate::CreatedNoteInfo> {
         match self {
             Self::Git(g) => {
-                g.create_from_template(template_id, path, fields, force, message)
+                // PATH A (nbl.6): `force` folds into the create precondition —
+                // force-overwrite (Blind) vs strict create (ExpectAbsent),
+                // matching the pre-cutover write_file/create_file branch.
+                let pc = if force.unwrap_or(false) {
+                    Precondition::Blind
+                } else {
+                    Precondition::ExpectAbsent
+                };
+                g.create_from_template(template_id, path, fields, pc, message)
                     .await
             }
             Self::Legacy { files, .. } => {

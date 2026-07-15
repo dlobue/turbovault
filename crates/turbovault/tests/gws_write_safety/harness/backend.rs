@@ -102,7 +102,16 @@ mod tests {
         build_state(world.dir.path(), "note.md", GitState::CleanCommitted);
 
         let before = world.read("note.md");
-        let res = world.tools.write_file("note.md", "NEW").await;
+        let res = world
+            .tools
+            .write_file(
+                "note.md",
+                "NEW",
+                turbovault_tools::WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
+            .await;
         let after = world.read("note.md");
 
         let observed = observe(res, after);

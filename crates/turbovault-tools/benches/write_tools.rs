@@ -32,7 +32,7 @@ use tokio::runtime::Runtime;
 use turbovault_batch::BatchOperation;
 use turbovault_core::config::{ServerConfig, VaultConfig};
 use turbovault_git::VaultRepo;
-use turbovault_tools::{CachedRepo, CommitLocks, WriteTools};
+use turbovault_tools::{CachedRepo, CommitLocks, WriteMode, WriteTools};
 use turbovault_vault::VaultManager;
 
 /// tlx.10/[12]: one process-wide runtime, built once and reused, so
@@ -109,7 +109,10 @@ fn bench_write_file_1kb(c: &mut Criterion) {
             legacy_fixture,
             |f| {
                 rt().block_on(async {
-                    f.tools.write_file("a.md", &content).await.unwrap();
+                    f.tools
+                        .write_file("a.md", &content, WriteMode::Overwrite, None, None)
+                        .await
+                        .unwrap();
                 });
             },
             BatchSize::SmallInput,
@@ -120,7 +123,10 @@ fn bench_write_file_1kb(c: &mut Criterion) {
             git_fixture,
             |f| {
                 rt().block_on(async {
-                    f.tools.write_file("a.md", &content).await.unwrap();
+                    f.tools
+                        .write_file("a.md", &content, WriteMode::Overwrite, None, None)
+                        .await
+                        .unwrap();
                 });
             },
             BatchSize::SmallInput,
@@ -131,7 +137,10 @@ fn bench_write_file_1kb(c: &mut Criterion) {
             git_cached_fixture,
             |f| {
                 rt().block_on(async {
-                    f.tools.write_file("a.md", &content).await.unwrap();
+                    f.tools
+                        .write_file("a.md", &content, WriteMode::Overwrite, None, None)
+                        .await
+                        .unwrap();
                 });
             },
             BatchSize::SmallInput,
@@ -148,7 +157,10 @@ fn bench_write_file_100kb(c: &mut Criterion) {
             legacy_fixture,
             |f| {
                 rt().block_on(async {
-                    f.tools.write_file("a.md", &content).await.unwrap();
+                    f.tools
+                        .write_file("a.md", &content, WriteMode::Overwrite, None, None)
+                        .await
+                        .unwrap();
                 });
             },
             BatchSize::SmallInput,
@@ -159,7 +171,10 @@ fn bench_write_file_100kb(c: &mut Criterion) {
             git_fixture,
             |f| {
                 rt().block_on(async {
-                    f.tools.write_file("a.md", &content).await.unwrap();
+                    f.tools
+                        .write_file("a.md", &content, WriteMode::Overwrite, None, None)
+                        .await
+                        .unwrap();
                 });
             },
             BatchSize::SmallInput,
@@ -170,7 +185,10 @@ fn bench_write_file_100kb(c: &mut Criterion) {
             git_cached_fixture,
             |f| {
                 rt().block_on(async {
-                    f.tools.write_file("a.md", &content).await.unwrap();
+                    f.tools
+                        .write_file("a.md", &content, WriteMode::Overwrite, None, None)
+                        .await
+                        .unwrap();
                 });
             },
             BatchSize::SmallInput,
@@ -188,14 +206,20 @@ fn bench_edit_file(c: &mut Criterion) {
     fn seeded_legacy() -> Fixture {
         let f = legacy_fixture();
         rt().block_on(async {
-            f.tools.write_file("a.md", "hello world\n").await.unwrap();
+            f.tools
+                .write_file("a.md", "hello world\n", WriteMode::Overwrite, None, None)
+                .await
+                .unwrap();
         });
         f
     }
     fn seeded_git() -> Fixture {
         let f = git_fixture();
         rt().block_on(async {
-            f.tools.write_file("a.md", "hello world\n").await.unwrap();
+            f.tools
+                .write_file("a.md", "hello world\n", WriteMode::Overwrite, None, None)
+                .await
+                .unwrap();
         });
         f
     }
@@ -205,7 +229,10 @@ fn bench_edit_file(c: &mut Criterion) {
             seeded_legacy,
             |f| {
                 rt().block_on(async {
-                    f.tools.edit_file("a.md", edits, None, false).await.unwrap();
+                    f.tools
+                        .edit_file("a.md", edits, None, false, None)
+                        .await
+                        .unwrap();
                 });
             },
             BatchSize::SmallInput,
@@ -216,7 +243,10 @@ fn bench_edit_file(c: &mut Criterion) {
             seeded_git,
             |f| {
                 rt().block_on(async {
-                    f.tools.edit_file("a.md", edits, None, false).await.unwrap();
+                    f.tools
+                        .edit_file("a.md", edits, None, false, None)
+                        .await
+                        .unwrap();
                 });
             },
             BatchSize::SmallInput,
@@ -233,14 +263,20 @@ fn bench_delete_file(c: &mut Criterion) {
     fn seeded_legacy() -> Fixture {
         let f = legacy_fixture();
         rt().block_on(async {
-            f.tools.write_file("a.md", "body").await.unwrap();
+            f.tools
+                .write_file("a.md", "body", WriteMode::Overwrite, None, None)
+                .await
+                .unwrap();
         });
         f
     }
     fn seeded_git() -> Fixture {
         let f = git_fixture();
         rt().block_on(async {
-            f.tools.write_file("a.md", "body").await.unwrap();
+            f.tools
+                .write_file("a.md", "body", WriteMode::Overwrite, None, None)
+                .await
+                .unwrap();
         });
         f
     }
@@ -250,7 +286,7 @@ fn bench_delete_file(c: &mut Criterion) {
             seeded_legacy,
             |f| {
                 rt().block_on(async {
-                    f.tools.delete_file("a.md").await.unwrap();
+                    f.tools.delete_file("a.md", None, None).await.unwrap();
                 });
             },
             BatchSize::SmallInput,
@@ -261,7 +297,7 @@ fn bench_delete_file(c: &mut Criterion) {
             seeded_git,
             |f| {
                 rt().block_on(async {
-                    f.tools.delete_file("a.md").await.unwrap();
+                    f.tools.delete_file("a.md", None, None).await.unwrap();
                 });
             },
             BatchSize::SmallInput,
@@ -278,14 +314,20 @@ fn bench_move_file(c: &mut Criterion) {
     fn seeded_legacy() -> Fixture {
         let f = legacy_fixture();
         rt().block_on(async {
-            f.tools.write_file("a.md", "body").await.unwrap();
+            f.tools
+                .write_file("a.md", "body", WriteMode::Overwrite, None, None)
+                .await
+                .unwrap();
         });
         f
     }
     fn seeded_git() -> Fixture {
         let f = git_fixture();
         rt().block_on(async {
-            f.tools.write_file("a.md", "body").await.unwrap();
+            f.tools
+                .write_file("a.md", "body", WriteMode::Overwrite, None, None)
+                .await
+                .unwrap();
         });
         f
     }
@@ -295,7 +337,7 @@ fn bench_move_file(c: &mut Criterion) {
             seeded_legacy,
             |f| {
                 rt().block_on(async {
-                    f.tools.move_file("a.md", "b.md").await.unwrap();
+                    f.tools.move_file("a.md", "b.md", None, None).await.unwrap();
                 });
             },
             BatchSize::SmallInput,
@@ -306,7 +348,7 @@ fn bench_move_file(c: &mut Criterion) {
             seeded_git,
             |f| {
                 rt().block_on(async {
-                    f.tools.move_file("a.md", "b.md").await.unwrap();
+                    f.tools.move_file("a.md", "b.md", None, None).await.unwrap();
                 });
             },
             BatchSize::SmallInput,

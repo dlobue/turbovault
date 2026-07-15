@@ -2,12 +2,12 @@
 //! `ExpectAbsent`), the same mold as `write_note`'s create path. Precondition
 //! axis is {Blind, Absent} only (a create carries no in-place/blob token).
 //!
-//! **SPEC-FIRST** (design doc §10 commit 1): drives the *aspirational* tool-layer
-//! method `GitFileTools::create_from_template(template_id, path, fields,
-//! precondition)` — which **does not exist yet** (today the only route is the
-//! `batch_execute` fold). No fixture is needed: the built-in `research` template
-//! is always registered by `TemplateEngine::default_templates`. Does not compile
-//! until the method lands.
+//! nbl.6 cutover: drives the real tool-layer method
+//! `GitFileTools::create_from_template(template_id, path, fields, precondition,
+//! message)`. No fixture is needed: the built-in `research` template is always
+//! registered by `TemplateEngine::default_templates`. The precondition is
+//! threaded to today's substrate primitives (behavior unchanged), so the
+//! `ExpectAbsent`-clobber cells on uncommitted-present state are `pending`.
 
 use std::collections::HashMap;
 
@@ -37,11 +37,12 @@ impl SinglePathOp for CreateFromTemplate {
             ("topic".to_string(), "gws".to_string()),
             ("date_researched".to_string(), "2026-01-01".to_string()),
         ]);
-        // Aspirational tool-layer method (does not exist yet — spec-first).
+        // nbl.6 cutover: the real tool-layer op takes the precondition directly.
         let res = world
             .tools
-            .create_from_template("research", rel, &fields, pc)
-            .await;
+            .create_from_template("research", rel, &fields, pc, None)
+            .await
+            .map(|_| ());
         let after = world.read(rel);
         observe(res, after)
     }
@@ -83,8 +84,24 @@ const CASES: &[Case] = &[
     Case::new(P::Absent, S::CommittedStaged, O::ConcurrencyError),
     Case::new(P::Absent, S::CommittedUnstaged, O::ConcurrencyError),
     Case::new(P::Absent, S::CommittedStagedUnstaged, O::ConcurrencyError),
-    Case::new(P::Absent, S::NewStaged, O::ConcurrencyError),
-    Case::new(P::Absent, S::IntentToAdd, O::ConcurrencyError),
-    Case::new(P::Absent, S::NewStagedUnstaged, O::ConcurrencyError),
-    Case::new(P::Absent, S::Untracked, O::ConcurrencyError),
+    // Uncommitted-but-present: HEAD has no entry, so expect_absent (checked vs
+    // HEAD today) wrongly passes and the create clobbers rather than refuses.
+    Case::pending(P::Absent, S::NewStaged, O::ConcurrencyError, ABSENT_CLOBBER),
+    Case::pending(
+        P::Absent,
+        S::IntentToAdd,
+        O::ConcurrencyError,
+        ABSENT_CLOBBER,
+    ),
+    Case::pending(
+        P::Absent,
+        S::NewStagedUnstaged,
+        O::ConcurrencyError,
+        ABSENT_CLOBBER,
+    ),
+    Case::pending(P::Absent, S::Untracked, O::ConcurrencyError, ABSENT_CLOBBER),
 ];
+
+// Burndown reason (nbl.8) — the aspirational behavior the cutover defers.
+const ABSENT_CLOBBER: &str =
+    "GWS: expect_absent checks HEAD, so an uncommitted-but-present file is clobbered, not refused";

@@ -19,6 +19,7 @@ use futures::future::BoxFuture;
 use std::path::PathBuf;
 use std::sync::Arc;
 use turbovault_batch::{BatchOperation, BatchResult, OperationRecord};
+use turbovault_core::Precondition;
 use turbovault_core::prelude::*;
 use turbovault_git::{Changeset, CommitHook, CommitLocks, Oid, VaultRepo};
 use turbovault_vault::{EditEngine, EditResult, VaultManager};
@@ -208,47 +209,32 @@ impl GitFileTools {
 
     /// Write a file. Overwrite by default; `mode` selects append/prepend.
     ///
-    /// `expected_hash`, when present, must be a **git blob oid hex string**
-    /// (40 hex chars) — the substrate's version token is the blob oid (not a
-    /// SHA-256 content hash); a non-Oid string is rejected loudly rather than
-    /// silently dropping CAS protection. `message` overrides the auto-derived
-    /// commit subject (`write_file <path>`).
+    /// The [`Precondition`] carries the write's safety contract (nbl.6):
+    /// - [`Precondition::ExpectAbsent`] → strict create (the substrate's
+    ///   `expect_absent` — refuses to clobber; absorbs the old `create_file`).
+    /// - [`Precondition::ExpectBlob`] → CAS-guarded overwrite. The token must
+    ///   be a **git blob oid hex string** (40 hex chars); a non-Oid string is
+    ///   rejected loudly rather than silently dropping CAS protection.
+    /// - [`Precondition::Blind`] / [`Precondition::ExpectExists`] → blind
+    ///   last-writer-wins overwrite (`ExpectExists` cannot originate for a
+    ///   wholesale-replace op; treated as blind).
+    ///
+    /// `message` overrides the auto-derived commit subject (`write_file <path>`).
     pub async fn write_file(
         &self,
         path: &str,
         content: &str,
         mode: WriteMode,
-        expected_hash: Option<&str>,
+        precondition: Precondition,
         message: Option<&str>,
     ) -> Result<()> {
         let final_content = self.resolve_write_content(path, content, mode).await?;
-        let expected = parse_blob_oid(expected_hash)?;
-        let txn = build_upsert_txn(
+        let txn = build_write_txn(
             subject(message, "write_file", path),
             path,
             &final_content,
-            expected,
-        );
-        self.apply_txn(&txn).await
-    }
-
-    /// Strict create: write a NEW file with an `expect_absent` precondition.
-    /// If the path becomes occupied between the caller's check and the
-    /// substrate's CAS, `apply_txn` returns `ConcurrencyError` — the create
-    /// race the MCP layer's pre-check cannot close on its own.
-    ///
-    /// This is the substrate-side guarantee for turbovault-947 / write-note
-    /// CAS-by-default: even with parallel subagents racing to create the
-    /// same absent path, exactly one commit lands; the loser sees a loud
-    /// ConcurrencyError and re-decides.
-    pub async fn create_file(
-        &self,
-        path: &str,
-        content: &str,
-        message: Option<&str>,
-    ) -> Result<()> {
-        let txn = Changeset::new(subject(message, "create_file", path))
-            .create(path, content.as_bytes().to_vec());
+            precondition,
+        )?;
         self.apply_txn(&txn).await
     }
 
@@ -259,11 +245,10 @@ impl GitFileTools {
         &self,
         path: &str,
         edits: &str,
-        expected_hash: Option<&str>,
+        precondition: Precondition,
         dry_run: bool,
         message: Option<&str>,
     ) -> Result<EditResult> {
-        let expected = parse_blob_oid(expected_hash)?;
         let current = self.read_file(path).await?;
         let engine = EditEngine::new();
         let blocks = engine.parse_blocks(edits)?;
@@ -278,6 +263,7 @@ impl GitFileTools {
         if dry_run {
             return Ok(result);
         }
+        let expected = in_place_expected(precondition)?;
         let txn = build_upsert_txn(
             subject(message, "edit_file", path),
             path,
@@ -288,34 +274,37 @@ impl GitFileTools {
         Ok(result)
     }
 
-    /// Delete a file. `expected_hash` (blob oid hex) enforces a CAS
-    /// precondition — omit it for a blind delete.
+    /// Delete a file. The [`Precondition`] guards the target: `ExpectBlob`
+    /// (blob oid hex) enforces a CAS precondition; `ExpectExists`/`Blind`
+    /// delete without one (an absent target is an idempotent no-op).
     pub async fn delete_file(
         &self,
         path: &str,
-        expected_hash: Option<&str>,
+        precondition: Precondition,
         message: Option<&str>,
     ) -> Result<()> {
-        let expected = parse_blob_oid(expected_hash)?;
-        let mut txn = Changeset::new(subject(message, "delete_file", path)).remove(path);
-        if let Some(oid) = expected {
-            txn = txn.expect_blob(path, oid);
-        }
+        let expected = in_place_expected(precondition)?;
+        let txn = remove_expecting(
+            Changeset::new(subject(message, "delete_file", path)),
+            path,
+            expected,
+        );
         self.apply_txn(&txn).await
     }
 
     /// Move a file — `remove(from) + upsert(to, bytes)` in one commit.
-    /// `expected_hash` guards the SOURCE; the destination is always
-    /// `expect_absent` (refuses to clobber). A caller-controllable destination
-    /// precondition arrives in the precondition cutover (Commit B).
+    /// The [`Precondition`] guards the SOURCE (`ExpectBlob` → CAS on `from`;
+    /// `ExpectExists`/`Blind` → none); the destination is always `expect_absent`
+    /// (refuses to clobber). A caller-controllable destination precondition is
+    /// deferred to the dual-path move burndown (turbovault-9n6).
     pub async fn move_file(
         &self,
         from: &str,
         to: &str,
-        expected_hash: Option<&str>,
+        precondition: Precondition,
         message: Option<&str>,
     ) -> Result<()> {
-        let expected_from = parse_blob_oid(expected_hash)?;
+        let expected_from = in_place_expected(precondition)?;
         let content = self.read_file(from).await?;
         let subject = message
             .map(str::to_string)
@@ -340,13 +329,16 @@ impl GitFileTools {
     // the op's info JSON for the MCP response. `expected_hash` is threaded now
     // for the precondition cutover (Commit B); today's MCP callers pass `None`.
 
-    /// Merge/replace frontmatter keys on a note.
+    /// Merge/replace frontmatter keys on a note. `precondition` guards the
+    /// note (threaded to [`Self::write_file`]); `compute_update_frontmatter`
+    /// reads the working tree first, so an absent target surfaces as
+    /// `FileNotFound`.
     pub async fn update_frontmatter(
         &self,
         path: &str,
         frontmatter: &std::collections::HashMap<String, serde_json::Value>,
         merge: Option<bool>,
-        expected_hash: Option<&str>,
+        precondition: Precondition,
         message: Option<&str>,
     ) -> Result<serde_json::Value> {
         let mt = crate::MetadataTools::new(Arc::clone(&self.manager));
@@ -359,7 +351,7 @@ impl GitFileTools {
             path,
             &new_content,
             WriteMode::Overwrite,
-            expected_hash,
+            precondition,
             message,
         )
         .await?;
@@ -367,12 +359,13 @@ impl GitFileTools {
     }
 
     /// Add/remove/list tags on a note. `list` is read-only (no write).
+    /// `precondition` guards the note (threaded to [`Self::write_file`]).
     pub async fn manage_tags(
         &self,
         path: &str,
         operation: &str,
         tags: Option<&[String]>,
-        expected_hash: Option<&str>,
+        precondition: Precondition,
         message: Option<&str>,
     ) -> Result<serde_json::Value> {
         let mt = crate::MetadataTools::new(Arc::clone(&self.manager));
@@ -382,7 +375,7 @@ impl GitFileTools {
                 path,
                 &new_content,
                 WriteMode::Overwrite,
-                expected_hash,
+                precondition,
                 message,
             )
             .await?;
@@ -390,26 +383,23 @@ impl GitFileTools {
         Ok(info)
     }
 
-    /// Create a note by rendering a registered template. `force` overwrites an
-    /// existing target; otherwise it is a strict create (`expect_absent`).
+    /// Create a note by rendering a registered template. The [`Precondition`]
+    /// carries the create contract (threaded to [`Self::write_file`]):
+    /// `ExpectAbsent` = strict create (default), `Blind` = force-overwrite.
     pub async fn create_from_template(
         &self,
         template_id: &str,
         path: &str,
         fields: &std::collections::HashMap<String, String>,
-        force: Option<bool>,
+        precondition: Precondition,
         message: Option<&str>,
     ) -> Result<crate::CreatedNoteInfo> {
         let engine = crate::TemplateEngine::new(Arc::clone(&self.manager));
         let (content, info) = engine
             .compute_from_template(template_id, path, fields.clone())
             .await?;
-        if force.unwrap_or(false) {
-            self.write_file(path, &content, WriteMode::Overwrite, None, message)
-                .await?;
-        } else {
-            self.create_file(path, &content, message).await?;
-        }
+        self.write_file(path, &content, WriteMode::Overwrite, precondition, message)
+            .await?;
         Ok(info)
     }
 
@@ -1235,6 +1225,45 @@ fn build_upsert_txn(
     txn
 }
 
+/// nbl.6: fold a wholesale-replace / create op's [`Precondition`] onto a fresh
+/// changeset for `path` with `content`:
+/// - [`Precondition::ExpectAbsent`] → `create` (carries the substrate's
+///   `expect_absent` — strict, no clobber).
+/// - [`Precondition::ExpectBlob`] → `upsert` + `expect_blob` (CAS overwrite).
+/// - [`Precondition::Blind`] / [`Precondition::ExpectExists`] → blind `upsert`
+///   (a replace op never legitimately carries `ExpectExists`; treated as blind).
+fn build_write_txn(
+    message: String,
+    path: &str,
+    content: &str,
+    precondition: Precondition,
+) -> Result<Changeset> {
+    Ok(match precondition {
+        Precondition::ExpectAbsent => {
+            Changeset::new(message).create(path, content.as_bytes().to_vec())
+        }
+        Precondition::ExpectBlob(hex) => {
+            build_upsert_txn(message, path, content, parse_blob_oid(Some(&hex))?)
+        }
+        Precondition::Blind | Precondition::ExpectExists => {
+            build_upsert_txn(message, path, content, None)
+        }
+    })
+}
+
+/// nbl.6: reduce an in-place op's [`Precondition`] to an optional `expect_blob`
+/// oid, threaded to today's substrate primitives (still checked vs the
+/// base/HEAD tree — behavior unchanged). Only [`Precondition::ExpectBlob`]
+/// produces a substrate precondition; [`Precondition::ExpectExists`] (the op's
+/// read already errors on an absent target) and [`Precondition::Blind`] add
+/// none. `ExpectAbsent` cannot originate for an in-place op; treated as none.
+fn in_place_expected(precondition: Precondition) -> Result<Option<Oid>> {
+    match precondition {
+        Precondition::ExpectBlob(hex) => parse_blob_oid(Some(&hex)),
+        Precondition::ExpectExists | Precondition::Blind | Precondition::ExpectAbsent => Ok(None),
+    }
+}
+
 /// v3b.2: fold `upsert(path, bytes)` plus an optional `expect_blob` CAS
 /// precondition (parsed from a blob-OID hex string) into `txn`. The shared tail
 /// of every content-replacing batch op (WriteNote / UpdateLinks / EditNote /
@@ -1435,7 +1464,13 @@ mod tests {
     async fn write_file_creates_commit_and_materializes() {
         let (tmp, tools) = setup().await;
         tools
-            .write_file("a.md", "alpha", WriteMode::Overwrite, None, None)
+            .write_file(
+                "a.md",
+                "alpha",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1449,11 +1484,23 @@ mod tests {
     async fn write_file_overwrites_existing() {
         let (_tmp, tools) = setup().await;
         tools
-            .write_file("a.md", "v1", WriteMode::Overwrite, None, None)
+            .write_file(
+                "a.md",
+                "v1",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         tools
-            .write_file("a.md", "v2", WriteMode::Overwrite, None, None)
+            .write_file(
+                "a.md",
+                "v2",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(tools.read_file("a.md").await.unwrap(), "v2");
@@ -1467,11 +1514,23 @@ mod tests {
     async fn cached_repo_path_writes_reuses_and_reads_back() {
         let (tmp, tools) = setup_cached().await;
         tools
-            .write_file("a.md", "v1", WriteMode::Overwrite, None, None)
+            .write_file(
+                "a.md",
+                "v1",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         tools
-            .write_file("a.md", "v2", WriteMode::Overwrite, None, None)
+            .write_file(
+                "a.md",
+                "v2",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(tools.read_file("a.md").await.unwrap(), "v2");
@@ -1485,7 +1544,13 @@ mod tests {
         );
         // A second distinct file through the same handle also lands.
         tools
-            .write_file("b.md", "B", WriteMode::Overwrite, None, None)
+            .write_file(
+                "b.md",
+                "B",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(tools.read_file("b.md").await.unwrap(), "B");
@@ -1497,7 +1562,13 @@ mod tests {
     async fn cached_repo_path_still_enforces_cas() {
         let (_tmp, tools) = setup_cached().await;
         tools
-            .write_file("a.md", "v1", WriteMode::Overwrite, None, None)
+            .write_file(
+                "a.md",
+                "v1",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         let bogus = VaultRepo::blob_oid_of(b"NOPE").unwrap();
@@ -1506,7 +1577,7 @@ mod tests {
                 "a.md",
                 "v2",
                 WriteMode::Overwrite,
-                Some(&bogus.to_string()),
+                turbovault_core::Precondition::ExpectBlob(bogus.to_string()),
                 None,
             )
             .await
@@ -1531,7 +1602,13 @@ mod tests {
         let (tmp, tools) = setup().await;
         // Seed an existing file so a stale `expected_hash` forces a CAS abort.
         tools
-            .write_file("s1.md", "v1", WriteMode::Overwrite, None, None)
+            .write_file(
+                "s1.md",
+                "v1",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         let stale = VaultRepo::blob_oid_of(b"STALE").unwrap().to_string();
@@ -1618,7 +1695,13 @@ mod tests {
     async fn batch_move_dest_collision_with_prior_write_is_caught() {
         let (tmp, tools) = setup().await;
         tools
-            .write_file("src.md", "body", WriteMode::Overwrite, None, None)
+            .write_file(
+                "src.md",
+                "body",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         let ops = vec![
@@ -1684,7 +1767,7 @@ mod tests {
                 "doc.md",
                 "alpha\nbeta\ngamma\n",
                 WriteMode::Overwrite,
-                None,
+                turbovault_core::Precondition::Blind,
                 None,
             )
             .await
@@ -1721,7 +1804,13 @@ mod tests {
     async fn batch_edit_note_stale_hash_aborts() {
         let (_tmp, tools) = setup().await;
         tools
-            .write_file("doc.md", "x\n", WriteMode::Overwrite, None, None)
+            .write_file(
+                "doc.md",
+                "x\n",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         let stale = VaultRepo::blob_oid_of(b"STALE").unwrap().to_string();
@@ -1745,7 +1834,7 @@ mod tests {
                 "n.md",
                 "---\ntitle: T\n---\nbody\n",
                 WriteMode::Overwrite,
-                None,
+                turbovault_core::Precondition::Blind,
                 None,
             )
             .await
@@ -1782,7 +1871,7 @@ mod tests {
                 "t.md",
                 "---\ntitle: T\n---\nbody\n",
                 WriteMode::Overwrite,
-                None,
+                turbovault_core::Precondition::Blind,
                 None,
             )
             .await
@@ -1810,7 +1899,7 @@ mod tests {
                 "t.md",
                 "---\ntags: [a]\n---\n",
                 WriteMode::Overwrite,
-                None,
+                turbovault_core::Precondition::Blind,
                 None,
             )
             .await
@@ -1860,7 +1949,13 @@ mod tests {
     async fn batch_create_from_template_strict_create_aborts_on_collision() {
         let (_tmp, tools) = setup().await;
         tools
-            .write_file("dup.md", "occupied", WriteMode::Overwrite, None, None)
+            .write_file(
+                "dup.md",
+                "occupied",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         let mut fields = std::collections::HashMap::new();
@@ -1888,7 +1983,13 @@ mod tests {
     async fn batch_move_note_rewrites_backlinks_by_default() {
         let (tmp, tools) = setup().await;
         tools
-            .write_file("old.md", "# Old\n", WriteMode::Overwrite, None, None)
+            .write_file(
+                "old.md",
+                "# Old\n",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         tools
@@ -1896,7 +1997,7 @@ mod tests {
                 "linker.md",
                 "see [[old]] here\n",
                 WriteMode::Overwrite,
-                None,
+                turbovault_core::Precondition::Blind,
                 None,
             )
             .await
@@ -1932,7 +2033,13 @@ mod tests {
     async fn batch_move_note_rename_only_when_backlinks_disabled() {
         let (tmp, tools) = setup().await;
         tools
-            .write_file("old.md", "# Old\n", WriteMode::Overwrite, None, None)
+            .write_file(
+                "old.md",
+                "# Old\n",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         tools
@@ -1940,7 +2047,7 @@ mod tests {
                 "linker.md",
                 "see [[old]] here\n",
                 WriteMode::Overwrite,
-                None,
+                turbovault_core::Precondition::Blind,
                 None,
             )
             .await
@@ -1968,7 +2075,13 @@ mod tests {
     async fn batch_delete_note_refuses_backlinked_by_default() {
         let (tmp, tools) = setup().await;
         tools
-            .write_file("doomed.md", "# Doomed\n", WriteMode::Overwrite, None, None)
+            .write_file(
+                "doomed.md",
+                "# Doomed\n",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         tools
@@ -1976,7 +2089,7 @@ mod tests {
                 "linker.md",
                 "see [[doomed]]\n",
                 WriteMode::Overwrite,
-                None,
+                turbovault_core::Precondition::Blind,
                 None,
             )
             .await
@@ -2005,7 +2118,13 @@ mod tests {
     async fn batch_delete_note_rewrite_stale_wraps_linkers() {
         let (tmp, tools) = setup().await;
         tools
-            .write_file("doomed.md", "# Doomed\n", WriteMode::Overwrite, None, None)
+            .write_file(
+                "doomed.md",
+                "# Doomed\n",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         tools
@@ -2013,7 +2132,7 @@ mod tests {
                 "linker.md",
                 "see [[doomed]] here\n",
                 WriteMode::Overwrite,
-                None,
+                turbovault_core::Precondition::Blind,
                 None,
             )
             .await
@@ -2040,7 +2159,13 @@ mod tests {
     async fn batch_delete_note_force_leaves_linkers_broken() {
         let (tmp, tools) = setup().await;
         tools
-            .write_file("doomed.md", "# Doomed\n", WriteMode::Overwrite, None, None)
+            .write_file(
+                "doomed.md",
+                "# Doomed\n",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         tools
@@ -2048,7 +2173,7 @@ mod tests {
                 "linker.md",
                 "see [[doomed]] here\n",
                 WriteMode::Overwrite,
-                None,
+                turbovault_core::Precondition::Blind,
                 None,
             )
             .await
@@ -2073,7 +2198,13 @@ mod tests {
     async fn write_file_with_stale_blob_oid_aborts_concurrency_error() {
         let (_tmp, tools) = setup().await;
         tools
-            .write_file("a.md", "v1", WriteMode::Overwrite, None, None)
+            .write_file(
+                "a.md",
+                "v1",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         // Use a deliberately wrong blob oid.
@@ -2083,7 +2214,7 @@ mod tests {
                 "a.md",
                 "v2",
                 WriteMode::Overwrite,
-                Some(&bogus.to_string()),
+                turbovault_core::Precondition::ExpectBlob(bogus.to_string()),
                 None,
             )
             .await
@@ -2104,7 +2235,13 @@ mod tests {
         // backends.
         let (_tmp, tools) = setup().await;
         let err = tools
-            .write_file("a.md", "v1", WriteMode::Overwrite, Some("not-a-hash"), None)
+            .write_file(
+                "a.md",
+                "v1",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::ExpectBlob("not-a-hash".into()),
+                None,
+            )
             .await
             .unwrap_err();
         assert!(
@@ -2117,10 +2254,19 @@ mod tests {
     async fn delete_file_removes_and_commits() {
         let (tmp, tools) = setup().await;
         tools
-            .write_file("a.md", "x", WriteMode::Overwrite, None, None)
+            .write_file(
+                "a.md",
+                "x",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
-        tools.delete_file("a.md", None, None).await.unwrap();
+        tools
+            .delete_file("a.md", turbovault_core::Precondition::Blind, None)
+            .await
+            .unwrap();
         assert!(!tmp.path().join("a.md").exists());
     }
 
@@ -2128,12 +2274,23 @@ mod tests {
     async fn move_file_atomic_remove_plus_add_one_commit() {
         let (tmp, tools) = setup().await;
         tools
-            .write_file("old.md", "body", WriteMode::Overwrite, None, None)
+            .write_file(
+                "old.md",
+                "body",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         let before = head_oid(&tools);
         tools
-            .move_file("old.md", "new.md", None, None)
+            .move_file(
+                "old.md",
+                "new.md",
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         assert!(!tmp.path().join("old.md").exists());
@@ -2148,15 +2305,27 @@ mod tests {
     async fn move_file_refuses_to_clobber_existing_destination() {
         let (_tmp, tools) = setup().await;
         tools
-            .write_file("a.md", "A", WriteMode::Overwrite, None, None)
+            .write_file(
+                "a.md",
+                "A",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         tools
-            .write_file("b.md", "B", WriteMode::Overwrite, None, None)
+            .write_file(
+                "b.md",
+                "B",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         let err = tools
-            .move_file("a.md", "b.md", None, None)
+            .move_file("a.md", "b.md", turbovault_core::Precondition::Blind, None)
             .await
             .unwrap_err();
         assert!(
@@ -2172,7 +2341,13 @@ mod tests {
     async fn copy_file_writes_destination_only() {
         let (_tmp, tools) = setup().await;
         tools
-            .write_file("a.md", "alpha", WriteMode::Overwrite, None, None)
+            .write_file(
+                "a.md",
+                "alpha",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         tools.copy_file("a.md", "b.md").await.unwrap();
@@ -2184,12 +2359,24 @@ mod tests {
     async fn edit_file_search_replace_commits() {
         let (_tmp, tools) = setup().await;
         tools
-            .write_file("a.md", "hello world\n", WriteMode::Overwrite, None, None)
+            .write_file(
+                "a.md",
+                "hello world\n",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         let edits = "<<<<<<< SEARCH\nhello world\n=======\nhi world\n>>>>>>> REPLACE\n";
         tools
-            .edit_file("a.md", edits, None, false, None)
+            .edit_file(
+                "a.md",
+                edits,
+                turbovault_core::Precondition::Blind,
+                false,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(tools.read_file("a.md").await.unwrap(), "hi world\n");
@@ -2199,13 +2386,25 @@ mod tests {
     async fn edit_file_dry_run_does_not_commit() {
         let (_tmp, tools) = setup().await;
         tools
-            .write_file("a.md", "hello\n", WriteMode::Overwrite, None, None)
+            .write_file(
+                "a.md",
+                "hello\n",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         let head_before = head_oid(&tools);
         let edits = "<<<<<<< SEARCH\nhello\n=======\nbye\n>>>>>>> REPLACE\n";
         let _ = tools
-            .edit_file("a.md", edits, None, true, None)
+            .edit_file(
+                "a.md",
+                edits,
+                turbovault_core::Precondition::Blind,
+                true,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(head_oid(&tools), head_before, "no commit on dry_run");
@@ -2220,12 +2419,24 @@ mod tests {
     async fn edit_file_returns_blob_oid_hashes_not_sha256() {
         let (_tmp, tools) = setup().await;
         tools
-            .write_file("a.md", "hello\n", WriteMode::Overwrite, None, None)
+            .write_file(
+                "a.md",
+                "hello\n",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         let edits = "<<<<<<< SEARCH\nhello\n=======\nbye\n>>>>>>> REPLACE\n";
         let result = tools
-            .edit_file("a.md", edits, None, false, None)
+            .edit_file(
+                "a.md",
+                edits,
+                turbovault_core::Precondition::Blind,
+                false,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -2254,19 +2465,37 @@ mod tests {
     async fn edit_file_new_hash_round_trips_as_expected_hash() {
         let (_tmp, tools) = setup().await;
         tools
-            .write_file("a.md", "v1\n", WriteMode::Overwrite, None, None)
+            .write_file(
+                "a.md",
+                "v1\n",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         let edits1 = "<<<<<<< SEARCH\nv1\n=======\nv2\n>>>>>>> REPLACE\n";
         let r1 = tools
-            .edit_file("a.md", edits1, None, false, None)
+            .edit_file(
+                "a.md",
+                edits1,
+                turbovault_core::Precondition::Blind,
+                false,
+                None,
+            )
             .await
             .unwrap();
         // Use r1.new_hash as the next expected_hash — must succeed because
         // no concurrent change has touched the file.
         let edits2 = "<<<<<<< SEARCH\nv2\n=======\nv3\n>>>>>>> REPLACE\n";
         let r2 = tools
-            .edit_file("a.md", edits2, Some(&r1.new_hash), false, None)
+            .edit_file(
+                "a.md",
+                edits2,
+                turbovault_core::Precondition::ExpectBlob(r1.new_hash.clone()),
+                false,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -2283,16 +2512,34 @@ mod tests {
     async fn edit_file_dry_run_hashes_match_real_apply() {
         let (_tmp, tools) = setup().await;
         tools
-            .write_file("a.md", "hello\n", WriteMode::Overwrite, None, None)
+            .write_file(
+                "a.md",
+                "hello\n",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         let edits = "<<<<<<< SEARCH\nhello\n=======\nbye\n>>>>>>> REPLACE\n";
         let dry = tools
-            .edit_file("a.md", edits, None, true, None)
+            .edit_file(
+                "a.md",
+                edits,
+                turbovault_core::Precondition::Blind,
+                true,
+                None,
+            )
             .await
             .unwrap();
         let live = tools
-            .edit_file("a.md", edits, None, false, None)
+            .edit_file(
+                "a.md",
+                edits,
+                turbovault_core::Precondition::Blind,
+                false,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(dry.old_hash, live.old_hash);
@@ -2304,7 +2551,16 @@ mod tests {
     async fn create_file_writes_absent_path() {
         let (tmp, tools) = setup().await;
         let head_before = head_oid(&tools);
-        tools.create_file("new.md", "fresh\n", None).await.unwrap();
+        tools
+            .write_file(
+                "new.md",
+                "fresh\n",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::ExpectAbsent,
+                None,
+            )
+            .await
+            .unwrap();
         assert_eq!(tools.read_file("new.md").await.unwrap(), "fresh\n");
         let head_after = head_oid(&tools).unwrap();
         assert_ne!(Some(head_after), head_before, "create advanced HEAD");
@@ -2322,7 +2578,13 @@ mod tests {
     async fn batch_write_note_with_stale_expected_hash_aborts_atomically() {
         let (tmp, tools) = setup().await;
         tools
-            .write_file("a.md", "v1\n", WriteMode::Overwrite, None, None)
+            .write_file(
+                "a.md",
+                "v1\n",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         let bogus = VaultRepo::blob_oid_of(b"NEVER_HERE").unwrap().to_string();
@@ -2361,7 +2623,13 @@ mod tests {
     async fn batch_write_note_with_matching_expected_hash_lands() {
         let (_tmp, tools) = setup().await;
         tools
-            .write_file("a.md", "v1\n", WriteMode::Overwrite, None, None)
+            .write_file(
+                "a.md",
+                "v1\n",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         let current = VaultRepo::blob_oid_of(b"v1\n").unwrap().to_string();
@@ -2385,7 +2653,13 @@ mod tests {
     async fn batch_create_note_force_true_is_blind_upsert() {
         let (_tmp, tools) = setup().await;
         tools
-            .write_file("dup.md", "v1\n", WriteMode::Overwrite, None, None)
+            .write_file(
+                "dup.md",
+                "v1\n",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         let ops = vec![BatchOperation::CreateNote {
@@ -2406,12 +2680,27 @@ mod tests {
     async fn create_file_aborts_on_existing_path() {
         let (tmp, tools) = setup().await;
         tools
-            .write_file("dup.md", "v1\n", WriteMode::Overwrite, None, None)
+            .write_file(
+                "dup.md",
+                "v1\n",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         let head_before = head_oid(&tools).unwrap();
 
-        let err = tools.create_file("dup.md", "v2\n", None).await.unwrap_err();
+        let err = tools
+            .write_file(
+                "dup.md",
+                "v2\n",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::ExpectAbsent,
+                None,
+            )
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, Error::ConcurrencyError { .. }),
             "expected ConcurrencyError, got: {err:?}"
@@ -2431,11 +2720,23 @@ mod tests {
         let (tmp, tools) = setup().await;
         // Seed for delete + move + update-links.
         tools
-            .write_file("seed_del.md", "gone", WriteMode::Overwrite, None, None)
+            .write_file(
+                "seed_del.md",
+                "gone",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         tools
-            .write_file("seed_mv.md", "moveme", WriteMode::Overwrite, None, None)
+            .write_file(
+                "seed_mv.md",
+                "moveme",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         tools
@@ -2443,7 +2744,7 @@ mod tests {
                 "links.md",
                 "see [[old-target]]",
                 WriteMode::Overwrite,
-                None,
+                turbovault_core::Precondition::Blind,
                 None,
             )
             .await
@@ -2518,7 +2819,13 @@ mod tests {
         // Atomicity contract: zero files from the batch should land.
         let (tmp, tools) = setup().await;
         tools
-            .write_file("exists.md", "already", WriteMode::Overwrite, None, None)
+            .write_file(
+                "exists.md",
+                "already",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         let head_before = head_oid(&tools);
@@ -2591,7 +2898,13 @@ mod tests {
         // Trigger a guaranteed precondition failure: write v1, then update
         // with a stale expected blob.
         tools
-            .write_file("a.md", "v1", WriteMode::Overwrite, None, None)
+            .write_file(
+                "a.md",
+                "v1",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         let stale_oid = VaultRepo::blob_oid_of(b"WAS_NEVER_HERE").unwrap();
@@ -2600,7 +2913,7 @@ mod tests {
                 "a.md",
                 "v2",
                 WriteMode::Overwrite,
-                Some(&stale_oid.to_string()),
+                turbovault_core::Precondition::ExpectBlob(stale_oid.to_string()),
                 None,
             )
             .await
@@ -2696,11 +3009,23 @@ mod tests {
         );
 
         tools
-            .write_file("a.md", "alpha", WriteMode::Overwrite, None, None)
+            .write_file(
+                "a.md",
+                "alpha",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         tools
-            .write_file("b.md", "beta", WriteMode::Overwrite, None, None)
+            .write_file(
+                "b.md",
+                "beta",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -2733,7 +3058,13 @@ mod tests {
         );
 
         tools
-            .write_file("a.md", "v1", WriteMode::Overwrite, None, None)
+            .write_file(
+                "a.md",
+                "v1",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         let stale_oid = VaultRepo::blob_oid_of(b"WAS_NEVER_HERE").unwrap();
@@ -2742,7 +3073,7 @@ mod tests {
                 "a.md",
                 "v2",
                 WriteMode::Overwrite,
-                Some(&stale_oid.to_string()),
+                turbovault_core::Precondition::ExpectBlob(stale_oid.to_string()),
                 None,
             )
             .await
@@ -2765,7 +3096,7 @@ mod tests {
                 "a.md",
                 "alpha",
                 WriteMode::Overwrite,
-                None,
+                turbovault_core::Precondition::Blind,
                 Some("add concept page for Alpha"),
             )
             .await
@@ -2778,7 +3109,13 @@ mod tests {
     async fn create_file_with_message_uses_caller_subject() {
         let (_tmp, tools) = setup().await;
         tools
-            .create_file("new.md", "fresh", Some("create stub page"))
+            .write_file(
+                "new.md",
+                "fresh",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::ExpectAbsent,
+                Some("create stub page"),
+            )
             .await
             .unwrap();
         let msg = head_commit_message(&tools);
@@ -2789,12 +3126,24 @@ mod tests {
     async fn edit_file_with_message_uses_caller_subject() {
         let (_tmp, tools) = setup().await;
         tools
-            .write_file("a.md", "hello\n", WriteMode::Overwrite, None, None)
+            .write_file(
+                "a.md",
+                "hello\n",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         let edits = "<<<<<<< SEARCH\nhello\n=======\nbye\n>>>>>>> REPLACE\n";
         let _ = tools
-            .edit_file("a.md", edits, None, false, Some("fix greeting"))
+            .edit_file(
+                "a.md",
+                edits,
+                turbovault_core::Precondition::Blind,
+                false,
+                Some("fix greeting"),
+            )
             .await
             .unwrap();
         let msg = head_commit_message(&tools);
@@ -2805,11 +3154,21 @@ mod tests {
     async fn delete_file_with_hash_and_message_uses_caller_subject() {
         let (_tmp, tools) = setup().await;
         tools
-            .write_file("a.md", "v", WriteMode::Overwrite, None, None)
+            .write_file(
+                "a.md",
+                "v",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         tools
-            .delete_file("a.md", None, Some("remove superseded page"))
+            .delete_file(
+                "a.md",
+                turbovault_core::Precondition::Blind,
+                Some("remove superseded page"),
+            )
             .await
             .unwrap();
         let msg = head_commit_message(&tools);
@@ -2820,11 +3179,22 @@ mod tests {
     async fn move_file_with_hash_and_message_uses_caller_subject() {
         let (_tmp, tools) = setup().await;
         tools
-            .write_file("a.md", "v", WriteMode::Overwrite, None, None)
+            .write_file(
+                "a.md",
+                "v",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         tools
-            .move_file("a.md", "b.md", None, Some("rename to canonical slug"))
+            .move_file(
+                "a.md",
+                "b.md",
+                turbovault_core::Precondition::Blind,
+                Some("rename to canonical slug"),
+            )
             .await
             .unwrap();
         let msg = head_commit_message(&tools);
@@ -2881,7 +3251,13 @@ mod tests {
     async fn move_with_link_updates_atomic_one_commit() {
         let (tmp, tools) = setup().await;
         tools
-            .write_file("old.md", "# Old\n", WriteMode::Overwrite, None, None)
+            .write_file(
+                "old.md",
+                "# Old\n",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         tools
@@ -2889,7 +3265,7 @@ mod tests {
                 "linker.md",
                 "I link to [[old]] here.\n",
                 WriteMode::Overwrite,
-                None,
+                turbovault_core::Precondition::Blind,
                 None,
             )
             .await
@@ -2927,7 +3303,13 @@ mod tests {
     async fn move_with_link_updates_handles_multiple_sources() {
         let (tmp, tools) = setup().await;
         tools
-            .write_file("old.md", "# Old\n", WriteMode::Overwrite, None, None)
+            .write_file(
+                "old.md",
+                "# Old\n",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         tools
@@ -2935,7 +3317,7 @@ mod tests {
                 "a.md",
                 "see [[old|the page]]\n",
                 WriteMode::Overwrite,
-                None,
+                turbovault_core::Precondition::Blind,
                 None,
             )
             .await
@@ -2945,7 +3327,7 @@ mod tests {
                 "b.md",
                 "embed: ![[old]]\nsection: [[old#Header]]\n",
                 WriteMode::Overwrite,
-                None,
+                turbovault_core::Precondition::Blind,
                 None,
             )
             .await
@@ -2959,7 +3341,7 @@ mod tests {
                 "c.md",
                 "golden oldie [[old]] keep [[keeper]]\n",
                 WriteMode::Overwrite,
-                None,
+                turbovault_core::Precondition::Blind,
                 None,
             )
             .await
@@ -3003,7 +3385,7 @@ mod tests {
                 "n.md",
                 "---\ntitle: T\n---\n\nbody line\n",
                 WriteMode::Overwrite,
-                None,
+                turbovault_core::Precondition::Blind,
                 None,
             )
             .await
@@ -3011,7 +3393,13 @@ mod tests {
 
         // Prepend lands below the closing `---`, above the body.
         tools
-            .write_file("n.md", "PRE", WriteMode::Prepend, None, None)
+            .write_file(
+                "n.md",
+                "PRE",
+                WriteMode::Prepend,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -3022,7 +3410,13 @@ mod tests {
 
         // Append lands at the very end.
         tools
-            .write_file("n.md", "POST", WriteMode::Append, None, None)
+            .write_file(
+                "n.md",
+                "POST",
+                WriteMode::Append,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         let after = tools.read_file("n.md").await.unwrap();
@@ -3066,7 +3460,13 @@ mod tests {
     async fn cached_handle_detects_external_ref_advance() {
         let (tmp, tools) = setup_cached().await;
         tools
-            .write_file("a.md", "v1", WriteMode::Overwrite, None, None)
+            .write_file(
+                "a.md",
+                "v1",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         let v1 = VaultRepo::blob_oid_of(b"v1").unwrap().to_string();
@@ -3077,7 +3477,13 @@ mod tests {
         // The cached handle must re-read the ref under lock and REJECT the write
         // carrying the now-stale precondition.
         let err = tools
-            .write_file("a.md", "v2", WriteMode::Overwrite, Some(&v1), None)
+            .write_file(
+                "a.md",
+                "v2",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::ExpectBlob(v1.clone()),
+                None,
+            )
             .await
             .unwrap_err();
         assert!(
@@ -3100,7 +3506,13 @@ mod tests {
     async fn delete_with_link_rewrite_to_stale_wraps_all_linkers() {
         let (tmp, tools) = setup().await;
         tools
-            .write_file("doomed.md", "# Doomed", WriteMode::Overwrite, None, None)
+            .write_file(
+                "doomed.md",
+                "# Doomed",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         tools
@@ -3108,7 +3520,7 @@ mod tests {
                 "a.md",
                 "see [[doomed]] for details\n",
                 WriteMode::Overwrite,
-                None,
+                turbovault_core::Precondition::Blind,
                 None,
             )
             .await
@@ -3118,7 +3530,7 @@ mod tests {
                 "b.md",
                 "another ref ![[doomed#Sec]]\n",
                 WriteMode::Overwrite,
-                None,
+                turbovault_core::Precondition::Blind,
                 None,
             )
             .await
@@ -3159,7 +3571,13 @@ mod tests {
     async fn list_inbound_backlinks_returns_linkers() {
         let (_tmp, tools) = setup().await;
         tools
-            .write_file("doomed.md", "# Doomed", WriteMode::Overwrite, None, None)
+            .write_file(
+                "doomed.md",
+                "# Doomed",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         tools
@@ -3167,7 +3585,7 @@ mod tests {
                 "linker.md",
                 "see [[doomed]]",
                 WriteMode::Overwrite,
-                None,
+                turbovault_core::Precondition::Blind,
                 None,
             )
             .await
@@ -3177,7 +3595,7 @@ mod tests {
                 "unrelated.md",
                 "no links here",
                 WriteMode::Overwrite,
-                None,
+                turbovault_core::Precondition::Blind,
                 None,
             )
             .await
@@ -3196,7 +3614,13 @@ mod tests {
     async fn move_with_link_updates_aborts_on_stale_source() {
         let (tmp, tools) = setup().await;
         tools
-            .write_file("old.md", "# Old\n", WriteMode::Overwrite, None, None)
+            .write_file(
+                "old.md",
+                "# Old\n",
+                WriteMode::Overwrite,
+                turbovault_core::Precondition::Blind,
+                None,
+            )
             .await
             .unwrap();
         tools
@@ -3204,7 +3628,7 @@ mod tests {
                 "linker.md",
                 "see [[old]]\n",
                 WriteMode::Overwrite,
-                None,
+                turbovault_core::Precondition::Blind,
                 None,
             )
             .await

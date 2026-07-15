@@ -240,11 +240,23 @@ async fn move_with_link_updates_lands_as_one_commit() {
     );
 
     tools
-        .write_file("old.md", "body", WriteMode::Overwrite, None, None)
+        .write_file(
+            "old.md",
+            "body",
+            WriteMode::Overwrite,
+            turbovault_core::Precondition::Blind,
+            None,
+        )
         .await
         .unwrap();
     tools
-        .write_file("link1.md", "see [[old]]", WriteMode::Overwrite, None, None)
+        .write_file(
+            "link1.md",
+            "see [[old]]",
+            WriteMode::Overwrite,
+            turbovault_core::Precondition::Blind,
+            None,
+        )
         .await
         .unwrap();
     tools
@@ -252,7 +264,7 @@ async fn move_with_link_updates_lands_as_one_commit() {
             "link2.md",
             "ref [[old]] here",
             WriteMode::Overwrite,
-            None,
+            turbovault_core::Precondition::Blind,
             None,
         )
         .await

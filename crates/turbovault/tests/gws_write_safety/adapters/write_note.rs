@@ -30,28 +30,13 @@ impl SinglePathOp for WriteNote {
     }
 
     async fn invoke(&self, world: &World, rel: &str, pc: Precondition) -> Observed {
-        let res = match pc {
-            // No precondition → blind overwrite/create.
-            Precondition::Blind => world.tools.write_file(rel, CONTENT).await,
-            // A version token → overwrite guarded by `expect_blob` (today checked
-            // against HEAD — the very bug several cells pin).
-            Precondition::ExpectBlob(oid) => {
-                world
-                    .tools
-                    .write_file_with_mode_and_message(
-                        rel,
-                        CONTENT,
-                        WriteMode::Overwrite,
-                        Some(&oid),
-                        "gws",
-                    )
-                    .await
-            }
-            // Create-only → the substrate's `expect_absent` path.
-            Precondition::ExpectAbsent => world.tools.create_file(rel, CONTENT).await,
-            // A wholesale-replace op never carries ExpectExists.
-            Precondition::ExpectExists => unreachable!("write_note has no ExpectExists cells"),
-        };
+        // nbl.6 cutover: the real op takes the precondition directly. Blind →
+        // blind overwrite/create; ExpectBlob → CAS overwrite; ExpectAbsent →
+        // the substrate's create/expect_absent path.
+        let res = world
+            .tools
+            .write_file(rel, CONTENT, WriteMode::Overwrite, pc, None)
+            .await;
         let after = world.read(rel);
         observe(res, after)
     }

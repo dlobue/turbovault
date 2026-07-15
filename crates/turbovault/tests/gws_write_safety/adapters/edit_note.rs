@@ -39,17 +39,10 @@ impl SinglePathOp for EditNote {
     async fn invoke(&self, world: &World, rel: &str, pc: Precondition) -> Observed {
         let current = world.read(rel).unwrap_or_default();
         let edits = edits_replacing(&current);
-        let expected_hash = match &pc {
-            Precondition::ExpectBlob(oid) => Some(oid.clone()),
-            // In-place default: it reads current, so it carries no caller token.
-            Precondition::ExpectExists => None,
-            Precondition::Blind | Precondition::ExpectAbsent => {
-                unreachable!("edit_note only carries ExpectExists / ExpectBlob")
-            }
-        };
+        // nbl.6 cutover: the real op takes the precondition directly.
         let res = world
             .tools
-            .edit_file(rel, &edits, expected_hash.as_deref(), false)
+            .edit_file(rel, &edits, pc, false, None)
             .await
             .map(|_| ());
         let after = world.read(rel);
@@ -184,7 +177,7 @@ pub fn extra_trials() -> Vec<Trial> {
             let edits = "<<<<<<< SEARCH\nNONEXISTENT-TEXT\n=======\nx\n>>>>>>> REPLACE\n";
             let res = world
                 .tools
-                .edit_file(REL, edits, None, false)
+                .edit_file(REL, edits, Precondition::ExpectExists, false, None)
                 .await
                 .map(|_| ());
             let after = world.read(REL);

@@ -11,19 +11,11 @@
 
 use super::state::Oids;
 
-/// The version-token / existence precondition, evaluated against the WORKING
-/// TREE. Mirrors HTTP conditional requests (If-Match / If-None-Match / `*`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Precondition {
-    /// `If-Match: "<etag>"` — path must currently hold exactly this blob (hex oid).
-    ExpectBlob(String),
-    /// `If-None-Match: *` — path must not exist (create-only).
-    ExpectAbsent,
-    /// `If-Match: *` — path must exist, any content (in-place ops' default).
-    ExpectExists,
-    /// No precondition; last-writer-wins.
-    Blind,
-}
+// nbl.6 cutover: the precondition now lives in `turbovault-core` and the real
+// mutating ops take it directly. The harness re-exports it so every adapter can
+// keep referring to `harness::precondition::Precondition`, and `resolve` hands
+// back the production type — the matrix drives the real op surface.
+pub use turbovault_core::Precondition;
 
 /// A well-formed, non-null blob oid that matches no real content — the matrix's
 /// `WRONG_OID`. Parses as a valid `git2::Oid` but never equals a stored blob.
