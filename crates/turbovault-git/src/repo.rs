@@ -11,6 +11,7 @@
 
 use crate::error::{Error, Result};
 use crate::locks::{CommitLocks, lock_recover};
+use crate::oid;
 use fs4::fs_std::FileExt;
 use git2::{Oid, Repository};
 use std::fs::OpenOptions;
@@ -34,13 +35,13 @@ pub type CommitHook = Arc<dyn Fn(Option<Oid>, Oid) + Send + Sync>;
 /// A handle to the git repository backing a vault.
 pub struct VaultRepo {
     repo: Repository,
-    /// gix repository handle (GX.0 scaffold, the gix cutover — `y1r`). gix's
-    /// `Repository` is `!Sync`, so this holds the `Sync + Clone`
-    /// `ThreadSafeRepository` and hands out a thread-local `gix::Repository`
-    /// per call via [`Self::gix`]; the existing commit-lock / spawn_blocking
+    /// gix repository handle (the gix cutover — `y1r`). gix's `Repository`
+    /// is `!Sync`, so this holds the `Sync + Clone` `ThreadSafeRepository`
+    /// and hands out a thread-local `gix::Repository` per call via
+    /// [`Self::gix`]; the existing commit-lock / spawn_blocking
     /// serialization already covers the access pattern this implies. Opened
-    /// alongside the git2 handle but not yet read by any op — GX.1-GX.10
-    /// port each module onto it.
+    /// alongside the git2 handle. GX.1 ports HEAD/branch resolution onto it
+    /// (below); GX.2-GX.10 port the remaining modules.
     gix_repo: gix::ThreadSafeRepository,
     /// Shared per-worktree commit-lock registry (GWS.6). All handles to the same
     /// worktree must share one registry to serialize the commit critical section.
@@ -148,7 +149,7 @@ impl VaultRepo {
 
     /// Whether `vault_root` is the root of a git repository.
     pub fn is_git_repo(vault_root: &Path) -> bool {
-        Repository::open(vault_root).is_ok()
+        gix::discover::is_git(&vault_root.join(".git")).is_ok()
     }
 
     /// The current branch's short name (e.g. `main`).
@@ -157,35 +158,34 @@ impl VaultRepo {
     /// branch). Works for an **unborn** branch too — the name exists before the
     /// first commit.
     pub fn current_branch(&self) -> Option<String> {
-        if self.repo.head_detached().unwrap_or(false) {
-            return None;
-        }
-        let head = self.repo.find_reference("HEAD").ok()?;
-        let target = head.symbolic_target().ok()??; // e.g. "refs/heads/main"
-        target.strip_prefix("refs/heads/").map(str::to_string)
+        self.gix()
+            .head_name()
+            .ok()?
+            .map(|name| name.shorten().to_string())
     }
 
     /// The full ref name HEAD points at (e.g. `refs/heads/main`), even when the
     /// branch is **unborn**. Errors if HEAD is detached (no branch ref).
     pub fn head_ref(&self) -> Result<String> {
-        let head = self.repo.find_reference("HEAD")?;
-        head.symbolic_target()
-            .map_err(Error::Git)?
-            .map(str::to_string)
+        self.gix()
+            .head_name()
+            .map_err(|e| Error::other(e.to_string()))?
+            .map(|name| name.to_string())
             .ok_or_else(|| Error::other("HEAD is detached; no branch ref"))
     }
 
     /// The HEAD commit oid, or `None` when the branch is **unborn** (no commits).
     pub fn head_oid(&self) -> Option<Oid> {
-        self.repo.head().ok()?.target()
+        self.gix()
+            .head()
+            .ok()?
+            .id()
+            .map(|id| oid::from_gix(id.detach()))
     }
 
     /// Whether the current branch is unborn (a fresh repo with no commits).
     pub fn is_unborn(&self) -> bool {
-        matches!(
-            self.repo.head(),
-            Err(ref e) if e.code() == git2::ErrorCode::UnbornBranch
-        )
+        self.gix().head().is_ok_and(|head| head.is_unborn())
     }
 
     /// First-parent oid of `commit`, or `None` for a root commit (the
@@ -254,11 +254,10 @@ impl VaultRepo {
         &self.repo
     }
 
-    /// A thread-local gix repository handle for this worktree (GX.0
-    /// scaffold). `gix::Repository` is `!Sync` — call this once per
-    /// operation rather than caching the return value across a thread or
-    /// await boundary; `ThreadSafeRepository::to_thread_local()` is cheap.
-    #[allow(dead_code)] // GX.1-GX.10 wire this into the ported ops.
+    /// A thread-local gix repository handle for this worktree. `gix::Repository`
+    /// is `!Sync` — call this once per operation rather than caching the
+    /// return value across a thread or await boundary;
+    /// `ThreadSafeRepository::to_thread_local()` is cheap.
     pub(crate) fn gix(&self) -> gix::Repository {
         self.gix_repo.to_thread_local()
     }
