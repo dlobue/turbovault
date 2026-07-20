@@ -11,7 +11,6 @@
 //! signature of this crate.
 
 /// Convert a git2 SHA-1 oid to its gix equivalent.
-#[allow(dead_code)] // GX.1-GX.10 wire this in as each module ports to gix.
 pub(crate) fn to_gix(oid: git2::Oid) -> gix::ObjectId {
     gix::ObjectId::from_bytes_or_panic(oid.as_bytes())
 }

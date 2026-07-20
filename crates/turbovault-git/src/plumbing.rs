@@ -8,6 +8,7 @@
 //! tree are separate, later steps (GWS.3, GWS.5).
 
 use crate::error::{Error, Result};
+use crate::oid;
 use crate::repo::VaultRepo;
 use git2::{Commit, Index, IndexEntry, IndexTime, Oid, Signature};
 use std::path::Path;
@@ -99,18 +100,32 @@ impl VaultRepo {
     /// The blob oid at `path` in `tree`, or `None` if absent. This is the value
     /// a changeset reads as its CAS pre-image (GWS.4) and what materialization
     /// resolves to working-tree bytes (GWS.5).
+    ///
+    /// Ported to gix (GX.2): `lookup_entry_by_path` returns `Ok(None)` for an
+    /// absent path directly, unlike git2's NotFound-error-code match.
     pub fn blob_oid_at(&self, tree: Oid, path: &str) -> Result<Option<Oid>> {
-        let tree = self.git().find_tree(tree)?;
-        match tree.get_path(Path::new(path)) {
-            Ok(entry) => Ok(Some(entry.id())),
-            Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
-            Err(e) => Err(Error::Git(e)),
-        }
+        let repo = self.gix();
+        let tree = repo
+            .find_tree(oid::to_gix(tree))
+            .map_err(|e| Error::other(e.to_string()))?;
+        let entry = tree
+            .lookup_entry_by_path(Path::new(path))
+            .map_err(|e| Error::other(e.to_string()))?;
+        Ok(entry.map(|e| oid::from_gix(e.id().detach())))
     }
 
     /// Read a blob's bytes by oid.
+    ///
+    /// Ported to gix (GX.2): `find_blob` decodes straight to an owned
+    /// `Vec<u8>`; `mem::take` lifts it out without a copy (the `Blob`'s
+    /// `Drop` impl returns its buffer to gix's reuse pool, so a plain field
+    /// move is rejected — swapping the field through `&mut` is not).
     pub fn read_blob(&self, oid: Oid) -> Result<Vec<u8>> {
-        Ok(self.git().find_blob(oid)?.content().to_vec())
+        let repo = self.gix();
+        let mut blob = repo
+            .find_blob(oid::to_gix(oid))
+            .map_err(|e| Error::other(e.to_string()))?;
+        Ok(std::mem::take(&mut blob.data))
     }
 
     /// Author/committer signature.
