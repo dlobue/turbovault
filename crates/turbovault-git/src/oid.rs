@@ -18,7 +18,6 @@ pub(crate) fn to_gix(oid: git2::Oid) -> gix::ObjectId {
 
 /// Convert a gix SHA-1 object id back to its git2 equivalent (see
 /// [`to_gix`]).
-#[allow(dead_code)] // GX.1-GX.10 wire this in as each module ports to gix.
 pub(crate) fn from_gix(oid: gix::ObjectId) -> git2::Oid {
     git2::Oid::from_bytes(oid.as_bytes()).expect("gix::ObjectId is always a 20-byte SHA-1 digest")
 }
