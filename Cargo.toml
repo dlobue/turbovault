@@ -104,6 +104,11 @@ path_trav = "2"           # Path traversal detection - security-focused
 git2 = "0.21"             # in-memory index, blob/tree/commit plumbing, ref CAS via Transaction
 fs4 = "0.13"              # cross-process advisory lock for commit + materialize
 
+# gix cutover (turbovault-y1r): pure-Rust git2 replacement, ported module-by-module.
+# git2 stays declared until GX.14 removes it; both deps are transiently declared,
+# not coexisting backends.
+gix = { version = "0.85", features = ["tree-editor", "blob-diff", "excludes"] }
+
 # DEFERRED (Phase 3+):
 # sonic-rs = "0.3"         # Fastest JSON parser, deferred optimization
 

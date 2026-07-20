@@ -26,6 +26,7 @@ mod fanout;
 mod locks;
 mod materialize;
 mod occ;
+mod oid;
 mod plumbing;
 mod repo;
 mod restore;

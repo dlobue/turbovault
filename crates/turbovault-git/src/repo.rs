@@ -34,6 +34,14 @@ pub type CommitHook = Arc<dyn Fn(Option<Oid>, Oid) + Send + Sync>;
 /// A handle to the git repository backing a vault.
 pub struct VaultRepo {
     repo: Repository,
+    /// gix repository handle (GX.0 scaffold, the gix cutover — `y1r`). gix's
+    /// `Repository` is `!Sync`, so this holds the `Sync + Clone`
+    /// `ThreadSafeRepository` and hands out a thread-local `gix::Repository`
+    /// per call via [`Self::gix`]; the existing commit-lock / spawn_blocking
+    /// serialization already covers the access pattern this implies. Opened
+    /// alongside the git2 handle but not yet read by any op — GX.1-GX.10
+    /// port each module onto it.
+    gix_repo: gix::ThreadSafeRepository,
     /// Shared per-worktree commit-lock registry (GWS.6). All handles to the same
     /// worktree must share one registry to serialize the commit critical section.
     commit_locks: Arc<CommitLocks>,
@@ -57,17 +65,30 @@ impl VaultRepo {
     /// Open at `vault_root` sharing the given commit-lock registry, so handles to
     /// the same worktree serialize their commit critical sections.
     pub fn open_with_locks(vault_root: &Path, commit_locks: Arc<CommitLocks>) -> Result<Self> {
-        match Repository::open(vault_root) {
-            Ok(repo) => Ok(Self {
-                repo,
-                commit_locks,
-                commit_hook: None,
-            }),
+        let repo = match Repository::open(vault_root) {
+            Ok(repo) => repo,
             Err(e) if e.code() == git2::ErrorCode::NotFound => {
-                Err(Error::NotARepo(vault_root.to_path_buf()))
+                return Err(Error::NotARepo(vault_root.to_path_buf()));
             }
-            Err(e) => Err(Error::Git(e)),
-        }
+            Err(e) => return Err(Error::Git(e)),
+        };
+        // GX.0 scaffold: open the same repository through gix. git2 already
+        // proved `vault_root` is a valid repo above, so this should never
+        // fail in practice; a mismatch here is a substrate invariant break,
+        // not a routine not-a-repo case, hence `Error::other` rather than
+        // `NotARepo`. Full gix open/HEAD error mapping lands at GX.1.
+        let gix_repo = gix::ThreadSafeRepository::open(vault_root).map_err(|e| {
+            Error::other(format!(
+                "gix failed to open {} after git2 opened it: {e}",
+                vault_root.display()
+            ))
+        })?;
+        Ok(Self {
+            repo,
+            gix_repo,
+            commit_locks,
+            commit_hook: None,
+        })
     }
 
     /// Open the repo with both a shared commit-lock registry AND a post-commit
@@ -231,6 +252,15 @@ impl VaultRepo {
     /// Borrow the underlying repository (for the plumbing layers).
     pub(crate) fn git(&self) -> &Repository {
         &self.repo
+    }
+
+    /// A thread-local gix repository handle for this worktree (GX.0
+    /// scaffold). `gix::Repository` is `!Sync` — call this once per
+    /// operation rather than caching the return value across a thread or
+    /// await boundary; `ThreadSafeRepository::to_thread_local()` is cheap.
+    #[allow(dead_code)] // GX.1-GX.10 wire this into the ported ops.
+    pub(crate) fn gix(&self) -> gix::Repository {
+        self.gix_repo.to_thread_local()
     }
 }
 
