@@ -22,8 +22,9 @@
 //! genuinely stale token — never a raw [`git2::Error`].
 
 use crate::error::{Error, Result};
+use crate::oid;
 use crate::repo::VaultRepo;
-use git2::{ObjectType, Oid};
+use git2::Oid;
 use tracing::instrument;
 use turbovault_core::Precondition;
 
@@ -33,8 +34,13 @@ impl VaultRepo {
     /// blob oid that [`Self::build_tree`] would store for the same bytes, so a
     /// token computed at read time can be compared directly against a base
     /// tree's entry at commit time.
+    ///
+    /// Ported to gix (GX.2): `compute_hash` is byte-identical to git2's
+    /// `Oid::hash_object` (proved by GX.0's parity test in `oid.rs`).
     pub fn blob_oid_of(content: &[u8]) -> Result<Oid> {
-        Ok(Oid::hash_object(ObjectType::Blob, content)?)
+        let hash = gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, content)
+            .map_err(|e| Error::other(e.to_string()))?;
+        Ok(oid::from_gix(hash))
     }
 
     /// Validate every `(path, Precondition)` against `base_tree` (the tree the
