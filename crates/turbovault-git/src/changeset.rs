@@ -10,7 +10,7 @@
 //!    base (GWS.4) — a mismatch aborts the whole plan (the reconsideration
 //!    domino), no retry — folds any `Rename` changes by reading `from`'s
 //!    bytes off the base tree (write-substrate-layering M2, design §6.2),
-//!    then builds the new tree in an isolated index (GWS.2) and
+//!    then builds the new tree via the gix tree Editor (GWS.2) and
 //!    `commit-tree`s on the tip. On a ref CAS loss the tip is re-read and the
 //!    attempt retried, which re-checks preconditions on the new base, so a
 //!    concurrent change to one of the plan's own paths surfaces as an abort,

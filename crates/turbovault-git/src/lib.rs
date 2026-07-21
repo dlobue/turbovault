@@ -1,7 +1,7 @@
 //! # turbovault-git — git-native write substrate
 //!
 //! Every vault mutation is a git commit built from plumbing — blobs written to
-//! the object DB, a tree assembled in an **isolated/ephemeral index** (never the
+//! the object DB, a tree assembled via the **gix tree Editor** (never the
 //! shared `.git/index`), a `commit-tree`, and a **compare-and-swap ref advance**
 //! — then materialized into the working tree. Git history is the rollback/audit
 //! log; `update-ref` CAS is the cross-process serialization primitive.
