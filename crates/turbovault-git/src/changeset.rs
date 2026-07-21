@@ -29,6 +29,7 @@
 //! — `ChangePlan` itself stays git2-free.
 
 use crate::error::{Error, Result};
+use crate::oid;
 use crate::plumbing::TreeChange;
 use crate::repo::VaultRepo;
 use git2::Oid;
@@ -136,8 +137,21 @@ impl VaultRepo {
             let committed = self.commit_with_retry(&refname, |tip| {
                 parent_at_apply = tip;
                 self.ensure_worktree_matches_commit(tip, &changed)?;
+                // Ported to gix (GX.6): resolve the tip commit's tree oid via
+                // the gix handle rather than git2 — the last git2 object call
+                // in the tip -> base_tree resolution step.
+                // `ensure_worktree_matches_commit` (above) and `materialize`
+                // (materialize.rs, below) still call git2 directly for their
+                // own object-DB reads and are ported separately.
                 let base_tree = match tip {
-                    Some(c) => Some(self.git().find_commit(c)?.tree_id()),
+                    Some(c) => Some(oid::from_gix(
+                        self.gix()
+                            .find_commit(oid::to_gix(c))
+                            .map_err(|e| Error::other(e.to_string()))?
+                            .tree_id()
+                            .map_err(|e| Error::other(e.to_string()))?
+                            .detach(),
+                    )),
                     None => None,
                 };
                 // Abort the whole plan if any precondition is stale. This
