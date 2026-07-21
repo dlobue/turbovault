@@ -12,7 +12,7 @@
 use crate::error::{Error, Result};
 use crate::oid;
 use crate::repo::VaultRepo;
-use git2::{Commit, Oid, Signature};
+use git2::Oid;
 use std::path::Path;
 use tracing::instrument;
 
@@ -94,21 +94,41 @@ impl VaultRepo {
     /// Create a commit object from `tree` and `parents` **without moving any
     /// ref** (this is `commit-tree`, not `commit`). The ref advance is a separate
     /// CAS step (GWS.3). Returns the new commit oid.
+    ///
+    /// Ported to gix (GX.4): `repo.write_object` writes the commit object
+    /// only and takes no `update_ref`-style parameter, so there is no
+    /// ref-moving alternative API to accidentally reach for here.
     #[instrument(
         skip(self),
         fields(tree = %tree, n_parents = parents.len(), message = %message),
         name = "git_commit_tree"
     )]
     pub fn commit_tree(&self, tree: Oid, parents: &[Oid], message: &str) -> Result<Oid> {
-        let repo = self.git();
-        let sig = self.author_signature()?;
-        let tree = repo.find_tree(tree)?;
-        let parent_commits: Vec<Commit> = parents
-            .iter()
-            .map(|oid| repo.find_commit(*oid))
-            .collect::<std::result::Result<_, _>>()?;
-        let parent_refs: Vec<&Commit> = parent_commits.iter().collect();
-        Ok(repo.commit(None, &sig, &sig, message, &tree, &parent_refs)?)
+        let repo = self.gix();
+        // gix's `write_object` serializes and hashes the commit bytes without
+        // dereferencing `tree`/`parents`, unlike the old git2
+        // `find_tree`/`find_commit` calls this replaced — a bad oid would
+        // otherwise be written as a dangling commit instead of erroring here.
+        repo.find_tree(oid::to_gix(tree))
+            .map_err(|e| Error::other(e.to_string()))?;
+        for parent in parents {
+            repo.find_commit(oid::to_gix(*parent))
+                .map_err(|e| Error::other(e.to_string()))?;
+        }
+        let sig = self.author_signature();
+        let commit = gix::objs::Commit {
+            tree: oid::to_gix(tree),
+            parents: parents.iter().map(|p| oid::to_gix(*p)).collect(),
+            author: sig.clone(),
+            committer: sig,
+            encoding: None,
+            message: message.into(),
+            extra_headers: vec![],
+        };
+        let written = repo
+            .write_object(&commit)
+            .map_err(|e| Error::other(e.to_string()))?;
+        Ok(oid::from_gix(written.detach()))
     }
 
     /// The blob oid at `path` in `tree`, or `None` if absent. This is the value
@@ -156,8 +176,16 @@ impl VaultRepo {
     /// documented upgrade path (architecture §13.5); plumbing that
     /// override into the substrate is a follow-up — until then this
     /// is the single default.
-    fn author_signature(&self) -> Result<Signature<'static>> {
-        Ok(Signature::now("TurboVault", "turbovault@localhost")?)
+    ///
+    /// Ported to gix (GX.4): `gix_actor::Signature` is a plain struct
+    /// literal, so unlike the old git2 constructor this can't fail and the
+    /// `Result` is dropped.
+    fn author_signature(&self) -> gix::actor::Signature {
+        gix::actor::Signature {
+            name: "TurboVault".into(),
+            email: "turbovault@localhost".into(),
+            time: gix::date::Time::now_local_or_utc(),
+        }
     }
 }
 
@@ -283,5 +311,26 @@ mod tests {
         assert_eq!(commit2.parent_id(0).unwrap(), c1);
         let b = vr.blob_oid_at(commit2.tree_id(), "b.md").unwrap().unwrap();
         assert_eq!(vr.read_blob(b).unwrap(), b"beta");
+    }
+
+    /// Regression (GX.4): `commit_tree` must error on a bogus tree or parent
+    /// oid rather than writing a dangling commit — the explicit
+    /// `find_tree`/`find_commit` existence checks in `commit_tree` exist
+    /// specifically to reject this before `write_object` runs.
+    #[test]
+    fn commit_tree_rejects_bogus_tree_and_parent_oids() {
+        let (_tmp, vr) = open_unborn();
+        let bogus = Oid::ZERO_SHA1;
+
+        assert!(
+            vr.commit_tree(bogus, &[], "msg").is_err(),
+            "commit_tree must error on a nonexistent tree oid"
+        );
+
+        let t1 = vr.build_tree(None, &[upsert("a.md", "alpha")]).unwrap();
+        assert!(
+            vr.commit_tree(t1, &[bogus], "msg").is_err(),
+            "commit_tree must error on a nonexistent parent oid"
+        );
     }
 }
