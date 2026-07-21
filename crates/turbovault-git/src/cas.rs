@@ -10,10 +10,35 @@
 //! rebuild on the new tip, and retry. The caller's builder re-runs its per-file
 //! preconditions (GWS.4) on each rebuild, so a conflicting change to one of the
 //! changeset's own paths surfaces as an abort rather than a silent overwrite.
+//!
+//! Ported to gix (GX.5): **not** via `gix::Repository::edit_reference`.
+//! gix-ref 0.65's transaction reads the ref's current value BEFORE acquiring
+//! its `.lock` file (`file/transaction/prepare.rs::lock_ref_and_apply_change`
+//! reads `existing_ref` first, then calls `obtain_lock()`), and compares
+//! against that pre-lock snapshot once the lock is held — a real TOCTOU:
+//! two racing writers can both pass the compare and both write, exactly the
+//! lost-update this primitive exists to prevent. (Confirmed by tracing the
+//! gix-ref source and by direct multi-threaded reproduction against
+//! `edit_reference`.) So `cas_ref` instead does its own lock-then-read-then-
+//! compare-then-write using `gix::lock::File` directly, at the identical
+//! `.lock` path gix-ref's own transaction would use — the SAME primitive
+//! gix-ref builds on, just correctly ordered. Any other writer of this ref
+//! (another `VaultRepo`, gix's own `edit_reference`, a human `git commit` or
+//! `git gc`) contends on that same lock file, so nobody can be mid-write
+//! while we read+compare+write. `commit_with_retry_n`'s loop is unchanged.
+//!
+//! Bypassing `edit_reference` also means bypassing its reflog write, so
+//! `cas_ref` writes `logs/<refname>` (and `logs/HEAD`, when `refname` is
+//! HEAD's current symbolic target) itself, using `gix::refs::log::Line` —
+//! gix-ref's own reflog-line type — for the serialization format, matching
+//! what `git update-ref`/`git commit` would have written.
 
 use crate::error::{Error, Result};
+use crate::oid;
 use crate::repo::VaultRepo;
 use git2::Oid;
+use std::io::Write as _;
+use std::path::Path;
 use tracing::instrument;
 
 /// How many times `commit_with_retry` rebuilds before giving up. Contention is
@@ -21,45 +46,137 @@ use tracing::instrument;
 const DEFAULT_MAX_RETRIES: u32 = 8;
 
 impl VaultRepo {
+    /// Read `refname`'s current tip via gix, discriminating an absent ref
+    /// (`Ok(None)`) from a real read/decode error (`Err`).
+    ///
+    /// tlx.9/hq8: `.ok()` would flatten an I/O/corruption error into `None`,
+    /// which on the initial-commit path (`expected_old == None`) could be
+    /// misread as "ref doesn't exist yet" and let a blind advance through.
+    /// `try_find_reference` already makes this distinction itself — `Ok(None)`
+    /// means genuinely absent, `Err` means a real read failure. Shared by
+    /// [`Self::cas_ref`] (the read under the ref's lock — the CAS comparison
+    /// itself) and [`Self::commit_with_retry_n`] (the tip fed to the builder).
+    fn read_ref_tip(&self, refname: &str) -> Result<Option<Oid>> {
+        Ok(self
+            .gix()
+            .try_find_reference(refname)
+            .map_err(|e| Error::other(e.to_string()))?
+            .and_then(|r| r.try_id())
+            .map(|id| oid::from_gix(id.detach())))
+    }
+
     /// Atomically advance `refname` from `expected_old` to `new`, under git's
     /// ref lock (mirrors `update-ref <new> <old>`).
     ///
     /// `expected_old == None` means the ref must **not** yet exist (the
     /// initial-commit case). On any mismatch returns a `ConcurrencyError` (via
     /// [`Error::concurrency`]) with **nothing applied** — the ref is untouched.
+    ///
+    /// Ported to gix (GX.5): locks first, THEN reads+compares+writes — see
+    /// the module doc for why `gix::Repository::edit_reference` can't be used
+    /// here (it reads before it locks). `gix::lock::File` is the exact
+    /// primitive gix-ref's own transaction uses internally for this same
+    /// `.lock` file; this just holds it for the whole read-compare-write
+    /// instead of only the write.
     #[instrument(
         skip(self),
         fields(refname = %refname, expected = ?expected_old, new = %new),
         name = "git_cas_ref"
     )]
     pub fn cas_ref(&self, refname: &str, expected_old: Option<Oid>, new: Oid) -> Result<()> {
-        let repo = self.git();
-        let mut tx = repo.transaction()?;
-        tx.lock_ref(refname)?;
-        // Read the current value *under the lock* — this is the CAS comparison.
-        // tlx.9: discriminate "ref absent" (NotFound) from a real read error.
-        // `.ok()` would flatten an I/O/corruption error into `None`, which on
-        // the initial-commit path (expected_old == None) could be misread as
-        // "ref doesn't exist yet" and let a blind advance through.
-        //
-        // hq8: the non-NotFound arm here is irreducible-defensive — `lock_ref`
-        // above already validated + read the ref, so a corrupt ref aborts at
-        // the lock, never reaching this read. The same guard in
-        // `commit_with_retry_n` (which has NO prior lock) IS reachable and is
-        // killed by `corrupt_ref_surfaces_error_instead_of_silent_absent`.
-        let current = match repo.refname_to_id(refname) {
-            Ok(oid) => Some(oid),
-            Err(e) if e.code() == git2::ErrorCode::NotFound => None,
-            Err(e) => return Err(Error::Git(e)),
-        };
+        // ponytail: `Fail::Immediately` — no backoff/retry on lock
+        // acquisition itself. Internal callers already serialize through
+        // `with_commit_lock`, so contention here means a genuinely external
+        // writer is mid-update; add `AfterDurationWithBackoff` if that's
+        // observed to matter in practice.
+        // `commondir`, not `path`: `refs/heads/*` is shared across worktrees
+        // (only HEAD and a few pseudorefs are worktree-private), and
+        // fan-out (GWS.9) calls `cas_ref` on `refs/heads/main` from a linked
+        // scratch worktree whose `path()` is the worktree-private admin dir
+        // (`.git/worktrees/<name>`), not where that ref actually lives.
+        // `commondir()` is the git-dir itself for a non-worktree repo, so
+        // this is correct either way.
+        let common = self.git().commondir();
+        let lock_target = common.join(refname);
+        let mut lock = gix::lock::File::acquire_to_update_resource(
+            &lock_target,
+            gix::lock::acquire::Fail::Immediately,
+            Some(common.to_path_buf()),
+        )
+        .map_err(|e| Error::other(e.to_string()))?;
+
+        // Fresh read UNDER the lock — this IS the CAS comparison. No other
+        // writer can be mid-update here: they'd need this same lock file.
+        // Same NotFound-vs-real-error discrimination as `read_ref_tip`
+        // always had: a corrupt/unreadable ref surfaces as `Err`, never a
+        // blind "absent" that would let a bogus initial-commit CAS through.
+        let current = self.read_ref_tip(refname)?;
         if current != expected_old {
-            // Dropping `tx` here releases the lock without committing.
+            // Dropping `lock` without committing deletes the `.lock` file;
+            // the ref itself is untouched.
             return Err(Error::concurrency(format!(
                 "ref CAS conflict on {refname}: expected {expected_old:?}, found {current:?}"
             )));
         }
-        tx.set_target(refname, new, None, "turbovault-git: cas advance")?;
-        tx.commit()?;
+
+        // Reflog before the ref content itself — mirrors real git's own
+        // ref-update ordering (files-backend.c writes the reflog entry
+        // before the final lockfile rename), and, on any reflog-write
+        // failure, aborts here with the ref still untouched rather than
+        // landing an unlogged advance.
+        let line = gix::refs::log::Line {
+            previous_oid: expected_old
+                .map(oid::to_gix)
+                .unwrap_or_else(|| gix::hash::Kind::Sha1.null()),
+            new_oid: oid::to_gix(new),
+            signature: self.author_signature(),
+            message: "turbovault-git: cas advance".into(),
+        };
+        self.append_reflog(common, refname, &line)?;
+
+        writeln!(lock, "{new}")?;
+        lock.commit().map_err(|e| Error::other(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Append `line` to `refname`'s reflog (`logs/<refname>` under the
+    /// shared `common` git-dir), creating the file and its parent directory
+    /// on the ref's first advance. When this worktree's HEAD is a symbolic
+    /// ref pointing at `refname` (the normal "committing on the checked-out
+    /// branch" case), also appends to this worktree's own private
+    /// `logs/HEAD` — exactly what `git update-ref`/`git commit` do for the
+    /// checked-out branch.
+    fn append_reflog(
+        &self,
+        common: &Path,
+        refname: &str,
+        line: &gix::refs::log::Line,
+    ) -> Result<()> {
+        Self::append_reflog_line(&common.join("logs").join(refname), line)?;
+
+        let head_points_here = self
+            .gix()
+            .head_name()
+            .ok()
+            .flatten()
+            .is_some_and(|name| name.to_string() == refname);
+        if head_points_here {
+            Self::append_reflog_line(&self.git().path().join("logs").join("HEAD"), line)?;
+        }
+        Ok(())
+    }
+
+    /// Append one reflog `line` to `log_path`, creating parent directories
+    /// (e.g. `logs/refs/heads/`) on first use. Reflogs are append-only.
+    fn append_reflog_line(log_path: &Path, line: &gix::refs::log::Line) -> Result<()> {
+        if let Some(parent) = log_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)?;
+        line.write_to(&mut file)?;
         Ok(())
     }
 
@@ -102,11 +219,7 @@ impl VaultRepo {
             // tlx.9: same NotFound-vs-real-error discrimination as cas_ref — an
             // unborn ref is `None`, but a real read error must surface, not
             // masquerade as "branch has no commits yet".
-            let tip = match self.git().refname_to_id(refname) {
-                Ok(oid) => Some(oid),
-                Err(e) if e.code() == git2::ErrorCode::NotFound => None,
-                Err(e) => return Err(Error::Git(e)),
-            };
+            let tip = self.read_ref_tip(refname)?;
             // `None` from the builder = no-op (e.g. an identity tree): nothing
             // to commit, so skip the CAS and leave the ref where it is.
             let new = match build(tip)? {
@@ -174,6 +287,64 @@ mod tests {
         assert_eq!(vr.head_oid(), Some(c1));
     }
 
+    /// turbovault-y1r.6: `cas_ref` must write a reflog entry for every
+    /// advance — bypassing `gix::Repository::edit_reference` (see the
+    /// module doc) means gix-ref's own reflog write is bypassed too, and
+    /// this is the substrate's only recovery instrument on a git-backed
+    /// vault (`git reflog`; the audit/rollback tools refuse there). Checks
+    /// both `logs/refs/heads/main` (the ref's own log) and `logs/HEAD`
+    /// (since HEAD points at `main` for both advances here).
+    #[test]
+    fn cas_ref_writes_reflog_entries() {
+        let (tmp, vr) = open_unborn();
+        let c0 = build_on(&vr, None, "a.md", "a");
+        vr.cas_ref(MAIN, None, c0).unwrap();
+        let c1 = build_on(&vr, Some(c0), "b.md", "b");
+        vr.cas_ref(MAIN, Some(c0), c1).unwrap();
+
+        let branch_log =
+            std::fs::read_to_string(tmp.path().join(".git/logs/refs/heads/main")).unwrap();
+        let head_log = std::fs::read_to_string(tmp.path().join(".git/logs/HEAD")).unwrap();
+
+        let zero = "0".repeat(40);
+        assert!(
+            branch_log.contains(&format!("{zero} {c0} ")),
+            "initial CAS (null -> c0) logged: {branch_log}"
+        );
+        assert!(
+            branch_log.contains(&format!("{c0} {c1} ")),
+            "advance (c0 -> c1) logged: {branch_log}"
+        );
+        assert!(
+            branch_log.matches("turbovault-git: cas advance").count() == 2,
+            "both advances carry the CAS reflog message: {branch_log}"
+        );
+        assert_eq!(
+            head_log, branch_log,
+            "HEAD's reflog mirrors the branch it symbolically points at"
+        );
+    }
+
+    /// turbovault-y1r.6 companion: a ref that is NOT HEAD's current target
+    /// must get its own reflog but must NOT touch `logs/HEAD` — otherwise
+    /// every fan-out / scratch-worktree ref advance would pollute the main
+    /// worktree's HEAD history.
+    #[test]
+    fn cas_ref_on_non_head_ref_does_not_touch_head_reflog() {
+        let (tmp, vr) = open_unborn();
+        let c0 = build_on(&vr, None, "a.md", "a");
+        vr.cas_ref("refs/heads/other", None, c0).unwrap();
+
+        assert!(
+            tmp.path().join(".git/logs/refs/heads/other").exists(),
+            "the advanced ref's own reflog is written"
+        );
+        assert!(
+            !tmp.path().join(".git/logs/HEAD").exists(),
+            "HEAD reflog untouched: HEAD (unborn `main`) never pointed at `other`"
+        );
+    }
+
     /// hq8 (tlx.9 follow-up): real fault injection — corrupt a throwaway `.git`
     /// loose ref so `refname_to_id` fails with a NON-NotFound error, and assert
     /// `cas_ref` / `commit_with_retry` SURFACE it instead of swallowing to
@@ -190,17 +361,17 @@ mod tests {
         std::fs::write(tmp.path().join(".git/refs/heads/main"), "not-a-valid-oid\n").unwrap();
         let vr = VaultRepo::open(tmp.path()).unwrap();
 
-        // Precondition: the corruption really yields a non-NotFound error — else
-        // the guard would legitimately map it to None and this proves nothing.
-        let code = vr.git().refname_to_id(MAIN).unwrap_err().code();
-        assert_ne!(
-            code,
-            git2::ErrorCode::NotFound,
-            "corruption must produce a non-NotFound error; got {code:?}"
+        // Precondition: the corruption really yields an `Err` (not `Ok(None)`,
+        // "absent") via GIX's `try_find_reference` — the read path `cas_ref`
+        // and `commit_with_retry_n` now exercise (GX.5) — else the guard would
+        // legitimately map it to `None` and this proves nothing.
+        assert!(
+            vr.gix().try_find_reference(MAIN).is_err(),
+            "corruption must produce a gix read error, not Ok(None) (absent)"
         );
 
-        // commit_with_retry resolves the tip via refname_to_id first, so a
-        // non-NotFound error must abort, not be treated as an unborn branch.
+        // commit_with_retry resolves the tip via the same gix read first, so a
+        // non-absent error must abort, not be treated as an unborn branch.
         let res = vr.commit_with_retry_n(MAIN, 0, |_tip| Ok(None));
         assert!(
             res.is_err(),

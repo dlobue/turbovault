@@ -162,7 +162,9 @@ impl VaultRepo {
         Ok(std::mem::take(&mut blob.data))
     }
 
-    /// Author/committer signature.
+    /// Author/committer signature. Also used as the reflog signature for
+    /// `cas.rs`'s ref-advance log entries, so `git log` and `git reflog`
+    /// agree on who made the change.
     ///
     /// turbovault-ov7 / TV-004: defaults to the built-in
     /// `TurboVault <turbovault@localhost>` identity so machine-authored
@@ -180,7 +182,7 @@ impl VaultRepo {
     /// Ported to gix (GX.4): `gix_actor::Signature` is a plain struct
     /// literal, so unlike the old git2 constructor this can't fail and the
     /// `Result` is dropped.
-    fn author_signature(&self) -> gix::actor::Signature {
+    pub(crate) fn author_signature(&self) -> gix::actor::Signature {
         gix::actor::Signature {
             name: "TurboVault".into(),
             email: "turbovault@localhost".into(),
