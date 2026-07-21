@@ -22,8 +22,11 @@
 //! it touched, and apply the restore changeset.
 
 use crate::error::{Error, Result};
+use crate::oid;
 use crate::repo::VaultRepo;
 use git2::Oid;
+use gix::bstr::ByteSlice;
+use gix::object::tree::diff::Change;
 use std::path::Path;
 use tracing::instrument;
 use turbovault_core::ChangePlan;
@@ -31,36 +34,37 @@ use turbovault_core::ChangePlan;
 impl VaultRepo {
     /// Read a path's bytes at a specific commit. `None` if the path is absent
     /// in that commit's tree. The bytes-level preview for the rollback UI.
+    ///
+    /// Ported to gix (GX.8): `lookup_entry_by_path` returns `Ok(None)` for an
+    /// absent path directly, unlike git2's NotFound-error-code match.
     pub fn read_at(&self, commit: Oid, path: &str) -> Result<Option<Vec<u8>>> {
-        let tree = self.git().find_commit(commit)?.tree()?;
-        match tree.get_path(Path::new(path)) {
-            Ok(entry) => Ok(Some(self.read_blob(entry.id())?)),
-            Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
-            Err(e) => Err(Error::Git(e)),
+        let repo = self.gix();
+        let tree = repo
+            .find_commit(oid::to_gix(commit))
+            .map_err(|e| Error::other(e.to_string()))?
+            .tree()
+            .map_err(|e| Error::other(e.to_string()))?;
+        let entry = tree
+            .lookup_entry_by_path(Path::new(path))
+            .map_err(|e| Error::other(e.to_string()))?;
+        match entry {
+            Some(entry) => Ok(Some(self.read_blob(oid::from_gix(entry.id().detach()))?)),
+            None => Ok(None),
         }
     }
 
     /// The set of paths whose content differs between commits `a` and `b`.
     /// For the rollback flow, pass the commit-to-undo as `b` and its parent as
     /// `a` to get exactly the paths to restore.
+    ///
+    /// Ported to gix (GX.8): thin wrapper over [`Self::diff_path_statuses`],
+    /// which owns the tree diff (and its two gotchas) in one place.
     pub fn paths_changed_between(&self, a: Oid, b: Oid) -> Result<Vec<String>> {
-        let r = self.git();
-        let a_tree = r.find_commit(a)?.tree()?;
-        let b_tree = r.find_commit(b)?.tree()?;
-        let diff = r.diff_tree_to_tree(Some(&a_tree), Some(&b_tree), None)?;
-        let mut paths = Vec::new();
-        diff.foreach(
-            &mut |delta, _| {
-                if let Some(p) = delta.new_file().path().or_else(|| delta.old_file().path()) {
-                    paths.push(p.to_string_lossy().to_string());
-                }
-                true
-            },
-            None,
-            None,
-            None,
-        )?;
-        Ok(paths)
+        Ok(self
+            .diff_path_statuses(Some(a), b)?
+            .into_iter()
+            .map(|(path, _present_in_b)| path)
+            .collect())
     }
 
     /// Per-path change status between two commits, or between the empty tree
@@ -74,34 +78,55 @@ impl VaultRepo {
     /// "added/modified → parse + add to graph" from "deleted → remove from
     /// graph". `paths_changed_between` collapses both into one bag, which
     /// loses the information.
+    ///
+    /// Ported to gix (GX.8): `Tree::changes` + `for_each_to_obtain_tree`
+    /// (feature `blob-diff`) replace the old git2 tree-diff + `foreach`,
+    /// with `a`'s tree the empty tree when `a` is `None`. Two gotchas gix's
+    /// git2 equivalent didn't have: (1) rename-tracking defaults ON, so
+    /// `track_rewrites(None)` is REQUIRED — otherwise a delete+add pair
+    /// collapses into a single `Rewrite` and the per-path counts break; (2)
+    /// gix also emits directory (`Tree`) rows that git2's file-only foreach
+    /// never produced, so results are filtered to `!entry_mode().is_tree()`
+    /// (i.e. `is_no_tree()`) — dropping only directories, same as git2 did,
+    /// and NOT narrowed to `is_blob()`, which would also silently drop
+    /// symlinks and gitlinks that git2's diff surfaced as ordinary deltas.
     pub fn diff_path_statuses(&self, a: Option<Oid>, b: Oid) -> Result<Vec<(String, bool)>> {
-        let r = self.git();
-        let b_tree = r.find_commit(b)?.tree()?;
+        let repo = self.gix();
+        let b_tree = repo
+            .find_commit(oid::to_gix(b))
+            .map_err(|e| Error::other(e.to_string()))?
+            .tree()
+            .map_err(|e| Error::other(e.to_string()))?;
         let a_tree = match a {
-            Some(oid) => Some(r.find_commit(oid)?.tree()?),
-            None => None,
+            Some(oid) => repo
+                .find_commit(oid::to_gix(oid))
+                .map_err(|e| Error::other(e.to_string()))?
+                .tree()
+                .map_err(|e| Error::other(e.to_string()))?,
+            None => repo.empty_tree(),
         };
-        let diff = r.diff_tree_to_tree(a_tree.as_ref(), Some(&b_tree), None)?;
 
         let mut out = Vec::new();
-        diff.foreach(
-            &mut |delta, _| {
-                let status = delta.status();
-                // Pick the path that actually exists on the relevant side.
-                let path = match status {
-                    git2::Delta::Deleted => delta.old_file().path(),
-                    _ => delta.new_file().path().or_else(|| delta.old_file().path()),
-                };
-                if let Some(p) = path {
-                    let present_in_b = !matches!(status, git2::Delta::Deleted);
-                    out.push((p.to_string_lossy().to_string(), present_in_b));
+        a_tree
+            .changes()
+            .map_err(|e| Error::other(e.to_string()))?
+            .options(|o| {
+                // Gotcha 1: without this, a delete+add pair collapses into a
+                // single Rewrite and the per-path counts break.
+                o.track_rewrites(None);
+            })
+            .for_each_to_obtain_tree(&b_tree, |change| {
+                // Gotcha 2: gix emits directory (Tree) rows too; git2 never did.
+                // Filter those out only — NOT is_blob(), which would also drop
+                // symlinks/gitlinks that git2's diff used to surface.
+                if change.entry_mode().is_no_tree() {
+                    let path = change.location().to_str_lossy().into_owned();
+                    let present_in_b = !matches!(change, Change::Deletion { .. });
+                    out.push((path, present_in_b));
                 }
-                true
-            },
-            None,
-            None,
-            None,
-        )?;
+                Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Continue(()))
+            })
+            .map_err(|e| Error::other(e.to_string()))?;
         Ok(out)
     }
 
@@ -118,6 +143,9 @@ impl VaultRepo {
     ///
     /// Returns `Ok(None)` when there is nothing to do (every path is already
     /// at the target state). Errors if the branch is unborn.
+    ///
+    /// Ported to gix (GX.8): tree resolution goes through `find_commit(..).
+    /// tree_id()`, mapped back to the public `Oid` via `oid::from_gix`.
     #[instrument(
         skip(self, paths, message),
         fields(target_commit = %target_commit, n_paths = paths.len()),
@@ -132,8 +160,18 @@ impl VaultRepo {
         let head_oid = self
             .head_oid()
             .ok_or_else(|| Error::other("cannot restore: branch is unborn"))?;
-        let head_tree = self.git().find_commit(head_oid)?.tree_id();
-        let target_tree = self.git().find_commit(target_commit)?.tree_id();
+        let repo = self.gix();
+        let commit_tree_id = |commit: Oid| -> Result<Oid> {
+            Ok(oid::from_gix(
+                repo.find_commit(oid::to_gix(commit))
+                    .map_err(|e| Error::other(e.to_string()))?
+                    .tree_id()
+                    .map_err(|e| Error::other(e.to_string()))?
+                    .detach(),
+            ))
+        };
+        let head_tree = commit_tree_id(head_oid)?;
+        let target_tree = commit_tree_id(target_commit)?;
 
         let mut txn = ChangePlan::new(message);
         let mut any = false;
@@ -410,5 +448,61 @@ mod tests {
         let c = commit(&vr, ChangePlan::new("c").create("a.md", "x"));
         let out = vr.diff_path_statuses(Some(c), c).unwrap();
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn diff_path_statuses_identical_content_delete_add_is_not_collapsed_into_a_rename() {
+        // Gotcha 1 regression: without track_rewrites(None), gix's default
+        // rewrite-tracking detects this delete+add pair (same content, two
+        // paths) as a single Rewrite instead of two independent deltas,
+        // which would lose the add/delete distinction the GWS.14 reindex
+        // apply step depends on.
+        let (_t, vr) = open_unborn();
+        let c1 = commit(&vr, ChangePlan::new("seed").create("old.md", "SAME"));
+        let blob = VaultRepo::blob_oid_of(b"SAME").unwrap();
+        let c2 = commit(
+            &vr,
+            ChangePlan::new("rename-like")
+                .delete("old.md", blob.to_string())
+                .create("new.md", "SAME"),
+        );
+
+        let mut out = vr.diff_path_statuses(Some(c1), c2).unwrap();
+        out.sort();
+        assert_eq!(
+            out,
+            vec![("new.md".to_string(), true), ("old.md".to_string(), false)],
+            "identical-content delete+add must stay two entries, not collapse into a rename"
+        );
+    }
+
+    #[test]
+    fn diff_path_statuses_surfaces_non_blob_entries_like_symlinks() {
+        // Gotcha 2 regression: the filter must drop only directory (Tree)
+        // rows, the way git2's file-only foreach did — NOT narrow to
+        // is_blob(), which would also silently drop symlinks/gitlinks that
+        // git2's diff used to surface as ordinary path deltas.
+        let (_t, vr) = open_unborn();
+        let c1 = commit(&vr, ChangePlan::new("seed").create("a.md", "A"));
+
+        // ChangePlan has no symlink support, so build the symlink entry with
+        // a raw git2 TreeBuilder to exercise a real non-blob, non-tree mode.
+        let repo = vr.git();
+        let c1_commit = repo.find_commit(c1).unwrap();
+        let target_blob = repo.blob(b"a.md").unwrap();
+        let mut tb = repo.treebuilder(Some(&c1_commit.tree().unwrap())).unwrap();
+        tb.insert("link.md", target_blob, 0o120_000).unwrap();
+        let tree = repo.find_tree(tb.write().unwrap()).unwrap();
+        let sig = git2::Signature::now("Test", "test@test").unwrap();
+        let c2 = repo
+            .commit(None, &sig, &sig, "add symlink", &tree, &[&c1_commit])
+            .unwrap();
+
+        let out = vr.diff_path_statuses(Some(c1), c2).unwrap();
+        assert_eq!(
+            out,
+            vec![("link.md".to_string(), true)],
+            "symlink addition must be surfaced, not silently dropped"
+        );
     }
 }
