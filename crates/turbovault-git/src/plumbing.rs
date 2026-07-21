@@ -1,16 +1,18 @@
-//! Object-DB plumbing (GWS.2): build trees in an **isolated index** and create
-//! commit objects, with **no working-tree interaction**.
+//! Object-DB plumbing (GWS.2): build trees via the **gix tree Editor** and
+//! create commit objects, with **no working-tree interaction**.
 //!
-//! The substrate stages from the batch's own bytes (not the working tree) into
-//! an ephemeral `git2::Index` that is never bound to `.git/index`, seeds it from
-//! a parent tree, applies the changeset's changes, and writes the tree +
-//! commit to the object DB. Advancing a ref (CAS) and materializing the working
-//! tree are separate, later steps (GWS.3, GWS.5).
+//! The substrate stages from the batch's own bytes (not the working tree)
+//! straight into the object DB: blobs are written with `gix`'s
+//! `write_blob`, and a tree Editor — seeded from a parent tree or the empty
+//! tree — applies the changeset's changes and writes the resulting tree. The
+//! Editor operates on tree objects directly; `.git/index` is never touched.
+//! Advancing a ref (CAS) and materializing the working tree are separate,
+//! later steps (GWS.3, GWS.5).
 
 use crate::error::{Error, Result};
 use crate::oid;
 use crate::repo::VaultRepo;
-use git2::{Commit, Index, IndexEntry, IndexTime, Oid, Signature};
+use git2::{Commit, Oid, Signature};
 use std::path::Path;
 use tracing::instrument;
 
@@ -35,46 +37,58 @@ impl TreeChange {
 
 impl VaultRepo {
     /// Build a tree from `base` (a parent commit's tree oid, or `None` for an
-    /// empty base) applying `changes` in an **isolated in-memory index**. Blobs
-    /// and the resulting tree are written to the object DB. The shared
-    /// `.git/index` is never touched. Returns the new tree oid.
+    /// empty base) applying `changes` via the **gix tree Editor**. Blobs and
+    /// the resulting tree are written to the object DB. The shared
+    /// `.git/index` is never touched — the Editor edits tree objects
+    /// directly. Returns the new tree oid.
+    ///
+    /// Ported to gix (GX.3): `EntryKind::Blob` is the regular-file mode
+    /// (100644), matching the previous git2 staging mode. Blobs are written
+    /// before their `upsert`, so `write()`'s existing-oid validation always
+    /// holds.
     #[instrument(
         skip(self, changes),
         fields(base = ?base, n_changes = changes.len()),
         name = "git_build_tree"
     )]
     pub fn build_tree(&self, base: Option<Oid>, changes: &[TreeChange]) -> Result<Oid> {
-        let repo = self.git();
-        let mut index = Index::new()?;
-        if let Some(base_oid) = base {
-            let tree = repo.find_tree(base_oid)?;
-            index.read_tree(&tree)?;
-        }
+        let repo = self.gix();
+        let mut editor = match base {
+            Some(base_oid) => repo
+                .find_tree(oid::to_gix(base_oid))
+                .map_err(|e| Error::other(e.to_string()))?
+                .edit()
+                .map_err(|e| Error::other(e.to_string()))?,
+            None => repo
+                .empty_tree()
+                .edit()
+                .map_err(|e| Error::other(e.to_string()))?,
+        };
         for change in changes {
             match change {
                 TreeChange::Upsert { path, content } => {
-                    let blob = repo.blob(content)?;
-                    index.add(&IndexEntry {
-                        ctime: IndexTime::new(0, 0),
-                        mtime: IndexTime::new(0, 0),
-                        dev: 0,
-                        ino: 0,
-                        mode: 0o100_644,
-                        uid: 0,
-                        gid: 0,
-                        file_size: content.len() as u32,
-                        id: blob,
-                        flags: 0,
-                        flags_extended: 0,
-                        path: path.as_bytes().to_vec(),
-                    })?;
+                    let blob_oid = repo
+                        .write_blob(content)
+                        .map_err(|e| Error::other(e.to_string()))?
+                        .detach();
+                    editor
+                        .upsert(path, gix::objs::tree::EntryKind::Blob, blob_oid)
+                        .map_err(|e| Error::other(e.to_string()))?;
                 }
                 TreeChange::Remove { path } => {
-                    index.remove_path(Path::new(path))?;
+                    // `remove_leaf` (not `remove`) errors if `path` names a
+                    // tree rather than a blob, matching the old git2-index
+                    // behavior (`git_index_remove_bypath` only matches blob
+                    // entries) — a `Remove` must not silently delete an
+                    // entire subtree.
+                    editor
+                        .remove_leaf(path)
+                        .map_err(|e| Error::other(e.to_string()))?;
                 }
             }
         }
-        Ok(index.write_tree_to(repo)?)
+        let written = editor.write().map_err(|e| Error::other(e.to_string()))?;
+        Ok(oid::from_gix(written.detach()))
     }
 
     /// Create a commit object from `tree` and `parents` **without moving any
@@ -217,6 +231,38 @@ mod tests {
             "a.md removed"
         );
         assert!(vr.blob_oid_at(t2, "b.md").unwrap().is_some(), "b.md kept");
+    }
+
+    /// Regression (GX.3): a `Remove` whose path names a **directory** must
+    /// error, not silently wipe the subtree. gix `Editor::remove`
+    /// (RemoveMode::Any) would delete the whole subtree with no error;
+    /// `remove_leaf` (RemoveMode::LeafOnly) errors on a tree, restoring the old
+    /// git2-index abort-nothing-applied behavior (`git_index_remove_bypath`
+    /// matched only blob entries).
+    #[test]
+    fn remove_of_a_directory_path_errors_not_a_silent_subtree_wipe() {
+        let (_tmp, vr) = open_unborn();
+        let base = vr
+            .build_tree(
+                None,
+                &[upsert("dir/note.md", "secret"), upsert("keep.md", "y")],
+            )
+            .unwrap();
+        let res = vr.build_tree(
+            Some(base),
+            &[TreeChange::Remove {
+                path: "dir".to_string(),
+            }],
+        );
+        assert!(
+            res.is_err(),
+            "removing a directory path must error, not wipe the subtree"
+        );
+        // build_tree is pure (it builds a NEW tree from base); base is untouched.
+        assert!(
+            vr.blob_oid_at(base, "dir/note.md").unwrap().is_some(),
+            "the base subtree must remain intact after the rejected remove"
+        );
     }
 
     #[test]
