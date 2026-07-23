@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use turbovault_core::Precondition;
 use turbovault_core::prelude::*;
 use turbovault_parser::parse_tags;
 use turbovault_vault::VaultManager;
@@ -163,13 +164,15 @@ impl MetadataTools {
         path: &str,
         frontmatter: serde_json::Map<String, Value>,
         merge: bool,
+        precondition: Precondition,
+        message: &str,
     ) -> Result<Value> {
         let (new_content, info) = self
             .compute_update_frontmatter(path, frontmatter, merge)
             .await?;
         let file_path = PathBuf::from(path);
         self.manager
-            .write_file(&file_path, &new_content, None)
+            .write_file(&file_path, &new_content, precondition, message)
             .await?;
         Ok(info)
     }
@@ -232,12 +235,14 @@ impl MetadataTools {
         path: &str,
         operation: &str,
         tags: Option<&[String]>,
+        precondition: Precondition,
+        message: &str,
     ) -> Result<Value> {
         let (maybe_write, info) = self.compute_manage_tags(path, operation, tags).await?;
         if let Some(new_content) = maybe_write {
             let file_path = PathBuf::from(path);
             self.manager
-                .write_file(&file_path, &new_content, None)
+                .write_file(&file_path, &new_content, precondition, message)
                 .await?;
         }
         Ok(info)

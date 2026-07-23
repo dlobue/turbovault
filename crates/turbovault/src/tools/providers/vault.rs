@@ -21,7 +21,7 @@ impl Deref for VaultProvider {
     }
 }
 
-#[turbomcp::server(name = "obsidian-vault", version = "1.5.0")]
+#[turbomcp::server(name = "obsidian-vault", version = "1.6.0")]
 impl VaultProvider {
     // ==================== Vault Lifecycle (Multi-Vault Management) ====================
 
@@ -103,6 +103,15 @@ impl VaultProvider {
             .map_err(|e| McpError::internal(format!("Failed to initialize vault: {}", e)))?;
 
         let manager = Arc::new(manager);
+
+        // M4c (bite 3a, turbovault-qae.5.3): wire the manager-owned reindex +
+        // change-listener (git vaults; no-op on Direct) BEFORE publishing to
+        // the cache. `add_vault` is the primary runtime entry point, and
+        // `get_active_vault_manager` always cache-hits once a manager is
+        // published — so without wiring here the drainer / HEAD-ref listener
+        // would never start and search-staleness would never close for any
+        // git vault added at runtime.
+        self.wire_manager_reindex(&name, &manager).await;
 
         // Cache the initialized manager
         {

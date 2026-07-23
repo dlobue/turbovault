@@ -1238,6 +1238,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "escape8259"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5692dd7b5a1978a5aeb0ce83b7655c58ca8efdcb79d21036ea249da95afec2c6"
+
+[[package]]
 name = "evmap"
 version = "11.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3318,6 +3324,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f02ab6bace2054fb888a3c16f990117b579d14a3088e472d63c6011fa185c9d3"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "libtest-mimic"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "14e6ba06f0ade6e504aff834d7c34298e5155c6baca353cc6a4aaff2f9fd7f33"
+dependencies = [
+ "anstream",
+ "anstyle",
+ "clap",
+ "escape8259",
 ]
 
 [[package]]
@@ -6305,13 +6323,15 @@ dependencies = [
 
 [[package]]
 name = "turbovault"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "config",
  "criterion",
  "git2",
+ "libtest-mimic",
  "log",
  "schemars",
  "serde",
@@ -6332,6 +6352,7 @@ dependencies = [
  "turbomcp-types",
  "turbovault-audit",
  "turbovault-core",
+ "turbovault-plugin-api",
  "turbovault-tools",
  "turbovault-vault",
  "uuid",
@@ -6340,7 +6361,7 @@ dependencies = [
 
 [[package]]
 name = "turbovault-audit"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "chrono",
  "log",
@@ -6357,7 +6378,7 @@ dependencies = [
 
 [[package]]
 name = "turbovault-batch"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "chrono",
  "schemars",
@@ -6372,7 +6393,7 @@ dependencies = [
 
 [[package]]
 name = "turbovault-core"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "chrono",
  "log",
@@ -6391,7 +6412,7 @@ dependencies = [
 
 [[package]]
 name = "turbovault-export"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "chrono",
  "serde",
@@ -6402,7 +6423,7 @@ dependencies = [
 
 [[package]]
 name = "turbovault-git"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "criterion",
  "fs4",
@@ -6418,7 +6439,7 @@ dependencies = [
 
 [[package]]
 name = "turbovault-graph"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "dashmap",
@@ -6433,7 +6454,7 @@ dependencies = [
 
 [[package]]
 name = "turbovault-parser"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "log",
  "pulldown-cmark",
@@ -6446,8 +6467,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "turbovault-plugin-api"
+version = "1.6.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "turbomcp-types",
+]
+
+[[package]]
 name = "turbovault-sql"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "gluesql",
  "log",
@@ -6461,11 +6494,10 @@ dependencies = [
 
 [[package]]
 name = "turbovault-tools"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "chrono",
- "criterion",
  "futures",
  "git2",
  "log",
@@ -6496,10 +6528,12 @@ dependencies = [
 
 [[package]]
 name = "turbovault-vault"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "dashmap",
+ "futures",
+ "git2",
  "log",
  "notify",
  "path_trav",
@@ -6514,6 +6548,7 @@ dependencies = [
  "tracing",
  "turbovault-audit",
  "turbovault-core",
+ "turbovault-git",
  "turbovault-graph",
  "turbovault-parser",
  "unicode-normalization",

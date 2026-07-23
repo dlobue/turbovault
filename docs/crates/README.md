@@ -4,20 +4,19 @@ This section provides detailed documentation for each individual crate in the `T
 
 ## Crate Overview
 
-The `TurboVault` project is organized as a Rust workspace with 8 crates:
+The `TurboVault` project is organized as a modular Rust workspace:
 
-| Crate | Purpose | Lines of Code | Key Features |
-|-------|---------|---------------|--------------|
-| **turbovault-core** | Core types, errors, config | ~2,000 LOC | Data models, error handling, configuration |
-| **turbovault-parser** | OFM parsing (wikilinks, frontmatter) | ~1,500 LOC | Markdown parsing, link extraction |
-| **turbovault-graph** | Link graph analysis | ~1,200 LOC | Graph algorithms, health analysis |
-| **turbovault-vault** | File I/O, caching, validation | ~1,800 LOC | Vault management, atomic operations |
-| **turbovault-batch** | Validated fail-fast operation batches | ~650 LOC | Conflict validation, sequencing, detailed results |
-| **turbovault-export** | JSON/CSV export formats | ~600 LOC | Data export, reporting |
-| **turbovault-tools** | Reusable MCP operations | ~2,500 LOC | Search, graph, metadata, and file operations |
-| **turbovault-server** | CLI + MCP server | ~600 LOC | Main binary, server orchestration |
-
-**Total**: ~11,000 lines of production Rust code
+| Crate | Purpose | Key Features |
+|-------|---------|--------------|
+| **turbovault-core** | Core types, errors, config | Data models, error handling, configuration |
+| **turbovault-parser** | OFM parsing (wikilinks, frontmatter) | Markdown parsing, link extraction |
+| **turbovault-graph** | Link graph analysis | Graph algorithms, health analysis |
+| **turbovault-vault** | File I/O, caching, validation | Vault management, atomic operations |
+| **turbovault-batch** | Validated fail-fast operation batches | Conflict validation, sequencing, detailed results |
+| **turbovault-export** | JSON/CSV export formats | Data export, reporting |
+| **turbovault-tools** | Reusable MCP operations | Search, graph, metadata, and file operations |
+| **turbovault-plugin-api** | Stable plugin boundary | Curated vault facade, provider contract, bounded hooks |
+| **turbovault-server** | CLI + MCP server | Main binary, server orchestration |
 
 ## Individual Crate Documentation
 
@@ -166,6 +165,15 @@ This crate implements the Model Context Protocol (MCP) tools that enable AI agen
 - Production-grade search engine built on Tantivy
 - Template system for consistent note creation
 - Comprehensive vault analysis and health monitoring
+
+### [turbovault-plugin-api](../../crates/turbovault-plugin-api/README.md)
+
+**Stable host boundary for compiled-in, feature-gated plugins.**
+
+This crate defines the curated `VaultApi`, plugin factory/provider contracts,
+strict namespacing rules, and bounded best-effort hook delivery. It
+intentionally does not expose raw vault managers or server internals. See the
+[plugin architecture guide](../development/plugins.md).
 
 ### [turbovault-server](../crates/turbovault-server/README.md)
 

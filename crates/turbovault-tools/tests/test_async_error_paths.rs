@@ -83,7 +83,13 @@ async fn test_file_tools_delete_locked_file() {
         .unwrap();
 
     // Attempt to delete while locked (behavior varies by OS)
-    let _result = tools.delete_file("locked.md").await;
+    let _result = tools
+        .delete_file(
+            "locked.md",
+            turbovault_core::Precondition::for_in_place(None),
+            "delete locked.md",
+        )
+        .await;
     // On Windows, this has been observed to succeed; on Unix, it might succeed
     #[cfg(windows)]
     assert!(_result.is_ok());
@@ -218,15 +224,20 @@ async fn test_batch_tools_partial_failure_rollback() {
         },
     ];
 
-    let result = tools.batch_execute(ops).await;
+    let result = tools.batch_execute(ops, "test batch").await;
     // Current implementation returns Ok(BatchResult { success: false }) not Err
     assert!(result.is_ok());
     let batch_result = result.unwrap();
     assert!(!batch_result.success);
-    assert_eq!(batch_result.executed, 2); // Should stop at operation 2 (the delete)
+    // write-substrate-layering M4d/M4e: the manager-routed batch folds every
+    // op into ONE ChangePlan and reports `executed: 0` on any apply failure
+    // (per-index `failed_at` tracking on the direct backend is M5.2 future
+    // work) — it does NOT mean nothing landed on disk; see below.
+    assert_eq!(batch_result.executed, 0);
 
-    // Note: Current implementation does NOT rollback - operations 0 and 1 remain
-    // This is "fail-fast" not "atomic rollback" behavior
+    // Note: the direct backend's apply loop is sequential with no rollback
+    // (only the precondition GATE is atomic) — operations 0 and 1 already
+    // landed on disk before the delete of a nonexistent file failed mid-loop.
     let vault_path = manager.vault_path();
     assert!(vault_path.join("file1.md").exists()); // Written before failure
     assert!(vault_path.join("file2.md").exists()); // Written before failure
@@ -247,7 +258,7 @@ async fn test_batch_tools_concurrent_batch_conflicts() {
             content: "Content from batch 1".to_string(),
             expected_hash: None,
         }];
-        tools1.batch_execute(ops).await
+        tools1.batch_execute(ops, "batch 1").await
     });
 
     let handle2 = tokio::spawn(async move {
@@ -256,7 +267,7 @@ async fn test_batch_tools_concurrent_batch_conflicts() {
             content: "Content from batch 2".to_string(),
             expected_hash: None,
         }];
-        tools2.batch_execute(ops).await
+        tools2.batch_execute(ops, "batch 2").await
     });
 
     let result1 = handle1.await.expect("Task panicked");

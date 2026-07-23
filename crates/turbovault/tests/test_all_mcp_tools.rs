@@ -121,7 +121,13 @@ async fn integration_test_file_operations() {
     assert!(result.is_ok());
 
     // Delete
-    let result = tools.delete_file("new.md").await;
+    let result = tools
+        .delete_file(
+            "new.md",
+            turbovault_core::Precondition::for_in_place(None),
+            "delete new.md",
+        )
+        .await;
     assert!(result.is_ok());
 }
 
@@ -286,7 +292,7 @@ async fn integration_test_batch_operations() {
         },
     ];
 
-    let result = tools.batch_execute(ops).await;
+    let result = tools.batch_execute(ops, "integration test batch").await;
     assert!(result.is_ok());
     let batch_result = result.unwrap();
     assert!(batch_result.success);
@@ -423,5 +429,12 @@ async fn integration_test_full_workflow() {
     assert!(health.total_notes >= 4);
 
     // 5. Clean up
-    file_tools.delete_file("workflow.md").await.unwrap();
+    file_tools
+        .delete_file(
+            "workflow.md",
+            turbovault_core::Precondition::for_in_place(None),
+            "delete workflow.md",
+        )
+        .await
+        .unwrap();
 }
