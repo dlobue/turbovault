@@ -548,7 +548,7 @@ impl CoreToolHandler {
             Ok(orphans) if orphans.is_empty() => {}
             Ok(orphans) => {
                 log::warn!(
-                    "Startup: detected {} orphan fanout worktree(s). Inspect via list_orphan_fanouts MCP tool; clean up with `git worktree remove <name>` + `git branch -D wip/<id>`.",
+                    "Startup: detected {} orphan fanout worktree(s). Inspect via list_orphan_fanouts MCP tool; clean up with `git worktree remove <path>` + `git branch -D wip/<id>` (use the per-orphan `path=` below — git registers the worktree under its path's basename, not `wip-<id>`).",
                     orphans.len()
                 );
                 for o in &orphans {
