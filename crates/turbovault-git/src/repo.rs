@@ -242,11 +242,37 @@ impl VaultRepo {
     }
 
     /// turbovault-lri: whether `path` (repo-root-relative) is excluded by
-    /// any active `.gitignore`. Thin wrapper over libgit2's
-    /// `is_path_ignored`. Used by the substrate's `include_ignored`
+    /// any active `.gitignore`. Used by the substrate's `include_ignored`
     /// policy enforcement.
+    ///
+    /// Ported to gix (GX.9), route (a) — the in-process `excludes`/
+    /// `AttributeStack` pipeline, not a `git check-ignore` shell-out. gix's
+    /// own docs alias this exact pair of calls to git2's `is_path_ignored`
+    /// (`#[doc(alias = "is_path_ignored", alias = "git2")]` on both
+    /// `Repository::excludes` and `AttributeStack::at_path`), so this is
+    /// the intended replacement, not a workaround. `index_or_empty()`
+    /// (rather than `index()`) covers the unborn-branch case: a fresh repo
+    /// has no `.git/index` file yet (nothing staged) and `index()` errors
+    /// on the missing file, where `index_or_empty()` hands back an empty
+    /// one — exactly what `is_path_ignored_honors_gitignore`
+    /// (changeset.rs) exercises via `open_unborn()`. Staying in-process
+    /// also matters on its own merits: `run_plan`
+    /// (turbovault-vault/src/substrate.rs) calls this once per touched
+    /// path in a batch, so a `git check-ignore` shell-out would be a
+    /// process spawn per file in the loop.
     pub fn is_path_ignored(&self, path: &str) -> Result<bool> {
-        Ok(self.repo.is_path_ignored(Path::new(path))?)
+        let repo = self.gix();
+        let index = repo
+            .index_or_empty()
+            .map_err(|e| Error::other(e.to_string()))?;
+        let mut stack = repo
+            .excludes(
+                &index,
+                None,
+                gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped,
+            )
+            .map_err(|e| Error::other(e.to_string()))?;
+        Ok(stack.at_path(path, None)?.is_excluded())
     }
 
     /// Borrow the underlying repository (for the plumbing layers).
