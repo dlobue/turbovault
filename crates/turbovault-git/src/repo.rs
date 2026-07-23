@@ -78,6 +78,30 @@ impl VaultRepo {
         // fail in practice; a mismatch here is a substrate invariant break,
         // not a routine not-a-repo case, hence `Error::other` rather than
         // `NotARepo`. Full gix open/HEAD error mapping lands at GX.1.
+        //
+        // GX.11 (turbovault-y1r.12): no trusted-local hashing config is
+        // added here, by investigation, not oversight. git2's
+        // `strict_hash_verification(false)` (PERF-3a) opted OUT of a
+        // redundant collision-detecting re-hash git2 performs by default
+        // on every object it reads. gix has no equivalent to opt out of
+        // because it never does that re-hash to begin with: gix's own
+        // crate docs say so explicitly ("`Integrity checks` ... `git2`
+        // by default performs integrity checks via
+        // `strict_hash_verification()` ... which `gitoxide` *currently*
+        // **does not have**", gix/src/lib.rs), and both the loose
+        // (gix-odb `loose::Store::find_inner`) and packed object read
+        // paths decode straight to the caller without re-hashing the
+        // result against the requested oid — verification there is a
+        // separate, explicit `verify_integrity()`/fsck operation, not
+        // part of an ordinary read. `gix::open::Options` has no
+        // hash-verification field to set either. So gix's default is
+        // already at least as cheap as git2 post-PERF-3a for this crate's
+        // trusted-local read pattern; no config change is possible or
+        // needed. (Separately: `init_libgit2_opts`/PERF-3a's
+        // `git2::opts::strict_hash_verification(false)` call is no
+        // longer present in this file's git2 path either, per repo
+        // history — orthogonal to gix and out of scope for GX.11, which
+        // only concerns the gix open configured here.)
         let gix_repo = gix::ThreadSafeRepository::open(vault_root).map_err(|e| {
             Error::other(format!(
                 "gix failed to open {} after git2 opened it: {e}",
