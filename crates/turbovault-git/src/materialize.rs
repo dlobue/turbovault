@@ -13,6 +13,7 @@
 //! which contend on the shared index.
 
 use crate::error::{Error, Result};
+use crate::oid;
 use crate::repo::VaultRepo;
 use git2::Oid;
 use std::path::Path;
@@ -24,6 +25,12 @@ impl VaultRepo {
     /// match the commit it is based on. This protects untracked files and
     /// unsaved/manual edits from being overwritten during materialization.
     /// Call while holding the commit lock.
+    ///
+    /// Ported to gix (GX.7): the tree resolution and per-path blob read go
+    /// through `self.gix()` / `lookup_entry_by_path` / `self.read_blob`,
+    /// matching GX.8's `read_at`; `Ok(None)` from `lookup_entry_by_path` is
+    /// "path absent in this commit", same meaning as git2's NotFound arm. The
+    /// staged-changes status check above stays on `self.git()` — untouched.
     pub(crate) fn ensure_worktree_matches_commit(
         &self,
         base: Option<Oid>,
@@ -47,17 +54,26 @@ impl VaultRepo {
         let workdir = repo
             .workdir()
             .ok_or_else(|| Error::other("bare repository has no working tree"))?;
+        let gix_repo = self.gix();
         let tree = match base {
-            Some(oid) => Some(repo.find_commit(oid)?.tree()?),
+            Some(oid) => Some(
+                gix_repo
+                    .find_commit(oid::to_gix(oid))
+                    .map_err(|e| Error::other(e.to_string()))?
+                    .tree()
+                    .map_err(|e| Error::other(e.to_string()))?,
+            ),
             None => None,
         };
 
         for rel in paths {
             let expected = match tree.as_ref() {
-                Some(tree) => match tree.get_path(Path::new(rel)) {
-                    Ok(entry) => Some(repo.find_blob(entry.id())?.content().to_vec()),
-                    Err(error) if error.code() == git2::ErrorCode::NotFound => None,
-                    Err(error) => return Err(Error::Git(error)),
+                Some(tree) => match tree
+                    .lookup_entry_by_path(Path::new(rel))
+                    .map_err(|e| Error::other(e.to_string()))?
+                {
+                    Some(entry) => Some(self.read_blob(oid::from_gix(entry.id().detach()))?),
+                    None => None,
                 },
                 None => None,
             };
@@ -85,6 +101,13 @@ impl VaultRepo {
     /// the index to that tree. For each path: present in the tree → write its
     /// blob atomically (temp + rename, parent dirs created); absent → remove the
     /// working-tree file if present. Idempotent (safe to re-run as a resync).
+    ///
+    /// Ported to gix (GX.7): per-path tree lookup and blob reads go through
+    /// `self.gix()` / `lookup_entry_by_path` / `self.read_blob`. The final
+    /// index sync stays on `self.git()` — `Index::read_tree` needs a git2
+    /// `Tree`, so `commit`'s tree is re-resolved via git2 for that one call
+    /// only; the hybrid mirrors `repo.rs` holding both a git2 and a gix
+    /// handle.
     #[instrument(
         skip(self, paths),
         fields(commit = %commit, n_paths = paths.len()),
@@ -96,19 +119,27 @@ impl VaultRepo {
             .workdir()
             .ok_or_else(|| Error::other("bare repository has no working tree"))?
             .to_path_buf();
-        let tree = repo.find_commit(commit)?.tree()?;
+        let gix_repo = self.gix();
+        let tree = gix_repo
+            .find_commit(oid::to_gix(commit))
+            .map_err(|e| Error::other(e.to_string()))?
+            .tree()
+            .map_err(|e| Error::other(e.to_string()))?;
 
         for rel in paths {
             let target = workdir.join(rel);
-            match tree.get_path(Path::new(rel)) {
-                Ok(entry) => {
-                    let blob = repo.find_blob(entry.id())?;
+            match tree
+                .lookup_entry_by_path(Path::new(rel))
+                .map_err(|e| Error::other(e.to_string()))?
+            {
+                Some(entry) => {
+                    let content = self.read_blob(oid::from_gix(entry.id().detach()))?;
                     if let Some(parent) = target.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
                     // Atomic per-file write: temp (unique suffix) + rename.
                     let tmp = target.with_extension(format!("tmp.{}", Uuid::new_v4()));
-                    if let Err(e) = std::fs::write(&tmp, blob.content()) {
+                    if let Err(e) = std::fs::write(&tmp, &content) {
                         let _ = std::fs::remove_file(&tmp);
                         return Err(e.into());
                     }
@@ -117,20 +148,20 @@ impl VaultRepo {
                         return Err(e.into());
                     }
                 }
-                Err(e) if e.code() == git2::ErrorCode::NotFound => {
+                None => {
                     // Removed in this commit: delete the working-tree file if present.
                     if target.exists() {
                         std::fs::remove_file(&target)?;
                     }
                 }
-                Err(e) => return Err(Error::Git(e)),
             }
         }
 
         // Sync the real index to the commit's tree so working tree == index ==
-        // HEAD and `git status` is clean for the touched paths.
+        // HEAD and `git status` is clean for the touched paths. Stays git2:
+        // `Index::read_tree` takes a git2 `Tree`, so re-resolve it here.
         let mut index = repo.index()?;
-        index.read_tree(&tree)?;
+        index.read_tree(&repo.find_commit(commit)?.tree()?)?;
         index.write()?;
         Ok(())
     }
